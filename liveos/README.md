@@ -4,7 +4,7 @@ A small bootable USB image (about 0.5–0.7 GB). Boot a broken Windows PC from i
 
 ## What happens at boot
 
-1. Pick **Live system** in the boot menu. Secure Boot can stay on.
+1. The boot menu starts **Rescue AI** automatically after 5 seconds. Secure Boot can stay on.
 2. Linux starts, connects through the Ethernet cable on its own, and syncs the clock.
 3. The agent mounts Windows **read-only** and opens the secure link.
 4. Screen 1 shows the status, the link, a QR code, what was found, and what Claude is doing.

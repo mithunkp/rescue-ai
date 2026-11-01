@@ -1,0 +1,17 @@
+#!/bin/sh
+# Boot menu: name the entries "Rescue AI" and start the first one after 5 seconds
+# instead of waiting for a key. Runs inside the binary image directory.
+set -e
+
+if [ -f boot/grub/grub.cfg ]; then
+	sed -i 's/Live system (amd64/Rescue AI (amd64/' boot/grub/grub.cfg
+	echo "set timeout=5" >> boot/grub/config.cfg
+fi
+
+for f in isolinux/live.cfg syslinux/live.cfg; do
+	[ -f "$f" ] && sed -i 's/Live system (amd64/Rescue AI (amd64/' "$f"
+done
+for f in isolinux/isolinux.cfg syslinux/syslinux.cfg; do
+	[ -f "$f" ] && sed -i 's/^timeout 0$/timeout 50/' "$f"
+done
+exit 0
