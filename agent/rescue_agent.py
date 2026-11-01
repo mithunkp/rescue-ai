@@ -1441,6 +1441,11 @@ def writable(part: dict, extra_options: str = ""):
         p = run(cmd)
         if p.returncode != 0:
             raise UserError(ntfs_hint(p.stderr or p.stdout))
+        mounted = mount_info(dev)
+        if not mounted or mounted[1]:
+            # ntfs-3g quietly falls back to read-only on a hibernated or uncleanly shut-down volume
+            run(["umount", str(target)])
+            raise UserError(ntfs_hint((p.stderr or p.stdout).strip() or "Windows is hibernated or unclean"))
         try:
             yield target
         finally:
