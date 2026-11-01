@@ -2,7 +2,7 @@
 
 Start a broken Windows PC from an Ubuntu USB stick, run one command, and get a link. Add that link to Claude, and Claude can look inside the PC (disks, crash records, event logs, registry, boot setup, update history) to find out what is wrong and tell you how to fix it.
 
-**It is read-only.** Windows drives are mounted read-only and locked at the disk level, and none of the tools can change anything. Claude diagnoses the problem and gives you steps to follow yourself.
+**Read-only unless you approve.** Windows drives are mounted read-only and locked at the disk level. Claude can *ask* to change something, but a card appears on the PC and nothing happens until you press **Y**. The disk is writable only during that one change, then it's locked read-only again.
 
 ---
 
@@ -67,6 +67,16 @@ Then describe the problem, for example:
 
 The terminal shows every tool Claude calls, so you can watch what it's looking at.
 
+When Claude asks to change something, the terminal beeps and shows a card with what will change, the risk, and Claude's reason. Press **Y** to approve or **N** to reject.
+
+Other keys:
+
+| Key | Action |
+|---|---|
+| **L** | New link |
+| **S** | Stop sharing |
+| **E** | Expert mode on/off: lets Claude ask to run commands, each still needing Y |
+
 ## 5. Stop
 
 Press **Ctrl+C** in the terminal. The link stops working immediately.
@@ -92,6 +102,27 @@ The activity log is in `/var/log/rescue-ai.log`. Ubuntu "Try" mode forgets every
 | `read_registry` | Reads the offline registry (SAM/SECURITY blocked) |
 | `list_directory`, `read_text_file` | Browses folders and reads log/text files |
 | `run_diagnostic` | Safe Linux hardware checks (kernel disk errors, PCI devices, memory, temperatures and more) |
+
+**Changes (each one needs Y on the PC):**
+
+| Tool | What it does | Undo |
+|---|---|---|
+| `request_set_registry_value` | Sets one value in the SYSTEM, SOFTWARE, DEFAULT or a user's registry | ✅ |
+| `request_disable_driver` | Stops a driver or service from loading at start-up | ✅ |
+| `request_rename_file` | Renames a file (nothing is deleted) | ✅ |
+| `request_copy_file` | Copies or restores a file; an existing file is backed up first | ✅ |
+| `request_clear_hibernation` | Removes the hibernation file and turns off Fast Startup | ❌ |
+| `request_boot_order` | Puts an entry first in the UEFI boot menu | ✅ |
+| `request_run_command` | Runs a command (expert mode only) | ❌ |
+| `request_undo`, `get_job_status`, `list_jobs` | Undo a change; check what happened | |
+
+Changes are refused when:
+- the disk reports failing health
+- Windows is hibernated or wasn't shut down cleanly (until `request_clear_hibernation`)
+- a registry hive has unsaved log data
+- the target is a personal file, a password store, or a raw registry hive file
+
+Undo records are saved in `RescueAI\undo\` on the changed partition.
 
 **Privacy:**
 - Files inside `C:\Users\...` are **hidden** unless you start with `--allow-personal-files`.
@@ -126,6 +157,6 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt evtx
 
 ## Limits of this version
 
-- **Read-only.** Claude explains the problem and gives you steps. It can't run repairs itself (that comes in a later milestone; see `../IMPLEMENTATION_PLAN.md`).
+- Repairs that need Windows' own tools (SFC, DISM, bcdboot, chkdsk) can't run here yet. Claude gives you steps for the Windows Recovery Environment instead (running them automatically is milestone M3 in `../IMPLEMENTATION_PLAN.md`).
 - It can't unlock BitLocker drives yet.
 - You get a new link every run.

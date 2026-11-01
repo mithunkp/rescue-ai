@@ -1,6 +1,10 @@
 # Rescue AI
 
-Boot a broken Windows PC from a USB stick and let Claude (or any MCP client) diagnose it through a secure link. The current version is **read-only**: Claude inspects disks, crash records, event logs, the registry, boot configuration, updates and drivers, then explains the problem and the fix steps.
+Boot a broken Windows PC from a USB stick and let Claude (or any MCP client) diagnose and fix it through a secure link.
+
+- Claude inspects disks, crash records, event logs, the registry, boot configuration, updates and drivers.
+- It can **ask** to make fixes: registry values, drivers, files, hibernation, boot order, and commands in expert mode.
+- Each fix shows on the PC's screen and only runs when the person there presses **Y**. Most fixes can be undone.
 
 | Folder | What it is |
 |---|---|
