@@ -14,7 +14,8 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ntfs-3g python3-hivex python3-venv
+          sudo apt-get install -y --no-install-recommends ntfs-3g python3-hivex python3-venv \
+            gddrescue wimtools mtools dosfstools fdisk ovmf
 
       - name: Python environment
         run: |
@@ -23,3 +24,6 @@ jobs:
 
       - name: Approved changes on a real NTFS disk image
         run: sudo .venv/bin/python agent/tests/test_changes_linux.py
+
+      - name: Backups, disk images and the Windows repair pipeline
+        run: sudo .venv/bin/python agent/tests/test_backup_repair_linux.py

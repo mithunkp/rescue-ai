@@ -11,6 +11,7 @@ Normally started by start.sh, which installs the dependencies first.
 import argparse
 import collections
 import contextlib
+import csv
 import datetime as dt
 import fnmatch
 import functools
@@ -170,12 +171,16 @@ How to work:
      you asked for and why, then call get_job_status about every 20 seconds.
      Never send the same request twice.
    - Prefer the smallest change. Changes can be reverted with request_undo,
-     except clearing hibernation and commands.
-   - Repairs that need Windows' own tools (SFC, DISM, bcdboot, chkdsk) can't run
-     here yet: give the person step-by-step instructions for the Windows
-     Recovery Environment instead.
+     except clearing hibernation, Windows repairs and commands.
+   - Before a risky repair, offer to back up their files: list_backup_drives,
+     then request_backup (e.g. sources ["profile:<user>"]).
+   - Windows' own tools (chkdsk, sfc, DISM, bcdboot): call check_repair_tools,
+     then request_windows_repair. Use list_installed_updates and
+     list_third_party_drivers to pick what to remove. These run for minutes to
+     an hour; poll get_job_status about once a minute.
    - request_run_command only works after the person turns on Expert mode.
-   - If disk health is bad, change nothing: tell them to copy their files first.
+   - If disk health is bad, change nothing. Rescue their files first:
+     request_backup or request_disk_image (both only read the failing disk).
 
 Notes:
 - Event-log "days" count back from the newest event in that log, because the
@@ -1325,23 +1330,30 @@ def pending_jobs() -> list[dict]:
     return waiting
 
 
+def undo_text(job: dict) -> str:
+    return {True: "Can be undone later.", False: "This cannot be undone.",
+            None: "Nothing on the Windows disk changes."}[job["reversible"]]
+
+
 def print_card(job: dict) -> None:
     bar = "!" * 74
     lines = [bar, f"  CLAUDE ASKS TO CHANGE THIS PC  (job {job['id']}, risk: {job['risk']})", f"  {job['title']}"]
     lines += [f"    {d}" for d in job["details"]]
-    lines += [f"  Reason given by the AI: {job['ai_reason']}",
-              "  " + ("Can be undone later." if job["reversible"] else "This cannot be undone."),
+    lines += [f"  Reason given by the AI: {job['ai_reason']}", "  " + undo_text(job),
               "  Press Y to approve or N to reject.", bar]
     print("\a\n" + "\n".join(lines), flush=True)
 
 
 def new_job(kind: str, title: str, details: list[str], risk: str, reason: str, run_fn,
-            reversible: bool = True) -> dict:
-    """Queue a change for approval on the PC's screen. run_fn(job) does the work once approved."""
+            reversible: bool | None = True, locked: bool = True) -> dict:
+    """Queue a change for approval on the PC's screen. run_fn(job) does the work once approved.
+
+    reversible=None means the job only reads the Windows disk (backups). locked=False lets other tools
+    keep working while a long job runs (it must take _LOCK itself where it touches shared state)."""
     job = {"id": next(_JOB_IDS), "kind": kind, "title": title, "details": details, "risk": risk,
            "reversible": reversible, "ai_reason": reason, "state": "waiting_for_approval",
-           "requested_at": dt.datetime.now().strftime("%H:%M:%S"), "result": None,
-           "_run": run_fn, "_created": time.time(), "_undo": None}
+           "requested_at": dt.datetime.now().strftime("%H:%M:%S"), "result": None, "progress": None,
+           "_run": run_fn, "_created": time.time(), "_undo": None, "_locked": locked}
     JOBS[job["id"]] = job
     ACTIVITY.append(f"{job['requested_at']}  AI ASKS TO CHANGE: {title} (job {job['id']})")
     log.info("Job %d requested: %s | %s | reason: %s", job["id"], title, " | ".join(details), reason)
@@ -1375,7 +1387,7 @@ def run_job(job: dict) -> None:
     job["state"] = "running"
     if SCREEN:
         SCREEN.refresh()
-    with _LOCK:
+    with _LOCK if job["_locked"] else contextlib.nullcontext():
         try:
             job["result"] = job["_run"](job) or {}
             job["state"] = "done"
@@ -1902,6 +1914,784 @@ def list_jobs() -> dict:
     return {"expert_mode": EXPERT, "jobs": [job_view(j) for j in JOBS.values()]}
 
 
+# ---------------------------------------------------------------- backup to a USB drive (M2)
+
+
+BACKUP_MOUNTS = Path("/mnt/rescue-backup")
+MEDIA_MOUNTS = Path("/mnt/rescue-media")
+BACKUP_FS = {"exfat", "vfat", "ntfs", "ext4", "ext3", "ext2", "btrfs", "xfs"}
+MEDIA_FS = BACKUP_FS | {"udf", "iso9660"}
+MOUNT_TYPES = {"ntfs": "ntfs-3g"}  # every other file system mounts under its own name
+# Windows "User Shell Folders" value -> usual folder name
+SHELL_FOLDERS = {"Desktop": "Desktop", "Personal": "Documents", "My Pictures": "Pictures", "My Video": "Videos",
+                 "My Music": "Music", "{374DE290-123F-4565-9164-39C4925E467B}": "Downloads"}
+# NTFS attributes of files whose data isn't on this disk, or can't be read here
+SKIP_ATTRIBUTES = {0x400000: "online-only (in the cloud, not on this PC)", 0x40000: "online-only (in the cloud)",
+                   0x1000: "offline file", 0x4000: "encrypted with Windows file encryption (EFS)"}
+
+
+def boot_disks() -> set[str]:
+    """Disks the rescue system itself started from: never offered as backup drives."""
+    if not shutil.which("findmnt"):
+        return set()
+    names = set()
+    for mp in ("/run/live/medium", "/cdrom", "/lib/live/mount/medium"):
+        src = run(["findmnt", "-n", "-o", "SOURCE", mp]).stdout.strip()
+        if src:
+            tree = run(["lsblk", "-s", "-n", "-r", "-o", "NAME,TYPE", src]).stdout
+            names |= {line.split()[0] for line in tree.splitlines() if line.endswith(" disk")}
+    return names
+
+
+def usb_partitions(filesystems: set[str]) -> list[dict]:
+    """Partitions with one of these file systems on USB or removable drives, except the rescue stick."""
+    skip = boot_disks()
+    found = []
+    for disk in disks():
+        removable = disk.get("tran") == "usb" or str(disk.get("rm")).lower() in ("1", "true")
+        if disk["name"] in skip or not removable:
+            continue
+        for part in disk.get("children") or [disk]:  # a stick may have no partition table
+            fs = (part.get("fstype") or "").lower()
+            if fs in filesystems:
+                found.append({"name": part["name"], "device": part["path"], "fstype": fs,
+                              "label": part.get("label") or "", "size_gb": gb(part.get("size")),
+                              "drive": disk.get("model") or disk["name"]})
+    return found
+
+
+def backup_candidates() -> list[dict]:
+    return usb_partitions(BACKUP_FS)
+
+
+def find_backup_drive(name: str) -> dict:
+    drives = backup_candidates()
+    drive = next((d for d in drives if d["name"] == name.removeprefix("/dev/")), None)
+    if not drive:
+        raise UserError("Backup drive not found; call list_backup_drives (the person may need to plug one in). "
+                        f"Available: {', '.join(d['name'] for d in drives) or 'none'}")
+    return drive
+
+
+@contextlib.contextmanager
+def drive_mounted(drive: dict, read_only: bool = False, base: Path | None = None):
+    """Mount a USB drive for as long as a job needs it (read-write for backups), then unmount it."""
+    if drive.get("path"):  # tests: a plain folder
+        yield Path(drive["path"])
+        return
+    existing = mount_info(drive["device"])
+    if existing and (read_only or not existing[1]):
+        yield Path(existing[0])
+        return
+    if existing:
+        raise UserError(f"{drive['name']} is mounted read-only somewhere else; unplug it and plug it in again.")
+    target = (base or BACKUP_MOUNTS) / drive["name"]
+    target.mkdir(parents=True, exist_ok=True)
+    fs = MOUNT_TYPES.get(drive["fstype"], drive["fstype"])
+    p = run(["mount", "-t", fs, "-o", "ro" if read_only else "rw", drive["device"], str(target)])
+    if p.returncode != 0:
+        raise UserError(f"Could not open {drive['name']}: {p.stderr.strip()}")
+    mounted = mount_info(drive["device"])
+    if not read_only and (not mounted or mounted[1]):
+        run(["umount", str(target)])
+        raise UserError(f"{drive['name']} could not be opened for writing (it may need checking on another PC).")
+    try:
+        yield target
+    finally:
+        run(["sync"])
+        run(["umount", str(target)])
+
+
+def known_folders(part: dict, user: str) -> list[tuple[str, Path]]:
+    """A user's Desktop, Documents, Pictures, Videos, Music and Downloads, following folders moved into OneDrive."""
+    root = Path(part["mountpoint"])
+    home = ci_path(root, f"Users/{user}")
+    if home is None or not home.is_dir():
+        raise UserError(f"No user folder named {user!r}.")
+    moved = {}
+    with contextlib.suppress(Exception):
+        top = hive_root(open_hive(ci_path(home, "NTUSER.DAT")))
+        moved = reg_values(subkey(top, "Software/Microsoft/Windows/CurrentVersion/Explorer/User Shell Folders"))
+    found = []
+    for value, name in SHELL_FOLDERS.items():
+        target, path = str(moved.get(value) or ""), None
+        if target.lower().startswith("%userprofile%"):
+            path = ci_path(home, target[len("%userprofile%"):])
+        elif re.match(r"^[A-Za-z]:\\", target):
+            path = ci_path(root, target[3:])
+        path = path or ci_path(home, name)
+        if path and path.is_dir():
+            found.append((name, path))
+    return found
+
+
+def walk_files(path: Path):
+    """Files under path (or path itself), never following links or junctions."""
+    if path.is_file():
+        yield path
+        return
+    for folder, _, files in os.walk(path, followlinks=False):
+        for name in files:
+            full = Path(folder) / name
+            if not full.is_symlink():
+                yield full
+
+
+def ntfs_attributes(path: Path) -> int:
+    for name, order in (("system.ntfs_attrib_be", "big"), ("system.ntfs_attrib", "little")):
+        try:
+            return int.from_bytes(os.getxattr(path, name, follow_symlinks=False)[:4], order)
+        except (OSError, AttributeError):
+            continue
+    return 0
+
+
+def copy_verified(src: Path, dst: Path, cancelled) -> str:
+    """Copy one file, read the copy back to check it, keep the original date. Returns its SHA-256."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    partial = dst.with_name(dst.name + ".partial")
+    digest = hashlib.sha256()
+    with open(src, "rb") as fin, open(partial, "wb") as fout:
+        while chunk := fin.read(1 << 20):
+            if cancelled():
+                fout.close()
+                partial.unlink()
+                raise UserError("cancelled")
+            digest.update(chunk)
+            fout.write(chunk)
+    check = hashlib.sha256()
+    with open(partial, "rb") as f:
+        while chunk := f.read(1 << 20):
+            check.update(chunk)
+    if check.digest() != digest.digest():
+        partial.unlink()
+        raise OSError("the copy did not match the original")
+    os.replace(partial, dst)
+    st = src.stat()
+    os.utime(dst, (st.st_atime, st.st_mtime))
+    return digest.hexdigest()
+
+
+def backup_sources(sources: list[str], partition: str) -> list[tuple[Path, str]]:
+    """Expand sources into (path, name in the backup); "profile:<user>" means that user's main folders."""
+    out = []
+    for source in sources:
+        if source.lower().startswith("profile:"):
+            user = source.split(":", 1)[1].strip()
+            out += [(path, f"{user}/{name}") for name, path in known_folders(get_part(partition), user)]
+        else:
+            part, path = resolve(source, partition)
+            out.append((path, rel_to(part["mountpoint"], path).replace("\\", "/")))
+    if not out:
+        raise UserError("Nothing to back up.")
+    return out
+
+
+def run_backup(job: dict, sources: list[tuple[Path, str]], drive: dict, folder: str,
+               total_files: int, total_bytes: int) -> dict:
+    files = nbytes = copied = 0
+    skipped, errors = [], []
+    fat32_limit = 4 * 2**30 - 1 if drive["fstype"] == "vfat" else None
+    last = 0.0
+
+    def cancelled():
+        return job.get("_cancel")
+
+    with drive_mounted(drive) as mount:
+        dest = mount / "RescueAI-Backup" / folder
+        dest.mkdir(parents=True, exist_ok=True)
+        with open(dest / "manifest.csv", "a", newline="", encoding="utf-8") as m, \
+                open(dest / "problems.csv", "a", newline="", encoding="utf-8") as p:
+            manifest, problems = csv.writer(m), csv.writer(p)
+            for src, name in sources:
+                for f in walk_files(src):
+                    if cancelled():
+                        raise UserError(f"Backup cancelled after {files:,} files; those are kept on the drive.")
+                    rel = name if f == src else f"{name}/{os.path.relpath(f, src)}".replace("\\", "/")
+                    target = dest / rel
+                    try:
+                        st = f.stat()
+                        why = next((text for bit, text in SKIP_ATTRIBUTES.items() if ntfs_attributes(f) & bit), None)
+                        if not why and fat32_limit and st.st_size > fat32_limit:
+                            why = "larger than 4 GB (the backup drive uses FAT32)"
+                        if why:
+                            skipped.append(f"{rel}: {why}")
+                            problems.writerow([rel, why])
+                        elif not (target.exists() and target.stat().st_size == st.st_size
+                                  and abs(target.stat().st_mtime - st.st_mtime) <= 2):  # else: already copied
+                            manifest.writerow([rel, st.st_size, copy_verified(f, target, cancelled)])
+                            copied += 1
+                        nbytes += st.st_size
+                    except UserError:
+                        raise UserError(f"Backup cancelled after {files:,} files; those are kept on the drive.")
+                    except OSError as e:
+                        errors.append(f"{rel}: {e.strerror or e}")
+                        problems.writerow([rel, f"could not be read or copied: {e.strerror or e}"])
+                    files += 1
+                    if time.time() - last > 0.5:
+                        job["progress"] = (f"{files:,} of {total_files:,} files, "
+                                           f"{nbytes / 1e9:.1f} of {total_bytes / 1e9:.1f} GB")
+                        last = time.time()
+                        if SCREEN:
+                            SCREEN.refresh()
+        (dest / "README.txt").write_text(
+            "Files rescued by Rescue AI.\n\nmanifest.csv: every copied file, its size and SHA-256 checksum.\n"
+            "problems.csv: files that were skipped or could not be read.\n", encoding="utf-8")
+    return {"saved_to": f"{drive['label'] or drive['name']}: RescueAI-Backup/{folder}",
+            "files_checked": files, "files_copied_now": copied, "already_there": files - copied - len(skipped) - len(errors),
+            "gb": round(nbytes / 1e9, 2), "skipped": len(skipped), "skipped_examples": skipped[:20],
+            "unreadable": len(errors), "unreadable_examples": errors[:20]}
+
+
+@tool
+def list_backup_drives() -> dict:
+    """USB drives that can receive a backup, with free space. The rescue stick itself is never listed."""
+    drives = backup_candidates()
+    for d in drives:
+        with contextlib.suppress(UserError, OSError):
+            with drive_mounted(d, read_only=True) as m:
+                d["free_gb"] = round(shutil.disk_usage(m).free / 1e9, 1)
+    if not drives:
+        return {"drives": [], "note": "No USB drive found. Ask the person to plug one in (exFAT or NTFS works "
+                                      "best; FAT32 can't hold files over 4 GB)."}
+    return {"drives": drives}
+
+
+@tool(change=True)
+def request_backup(sources: list[str], destination: str, reason: str, partition: str = "") -> dict:
+    """Ask to copy files from the Windows disk to a USB drive (approved on the PC's screen). The
+    Windows disk is only read, so this is allowed even when the disk is failing.
+
+    sources: folders or files on the Windows partition, or "profile:<username>" for that user's Desktop,
+    Documents, Pictures, Videos, Music and Downloads (also when they were moved into OneDrive).
+    destination: a drive name from list_backup_drives. Files go to RescueAI-Backup/<PC>_<date>/ with
+    manifest.csv (checksum of every file) and problems.csv. Running it again the same day continues
+    where it stopped. Online-only OneDrive files and EFS-encrypted files can't be copied and are listed."""
+    drive = find_backup_drive(destination)
+    items = backup_sources(sources, partition)
+    total_files = total_bytes = 0
+    for path, _ in items:
+        for f in walk_files(path):
+            with contextlib.suppress(OSError):
+                total_bytes += f.stat().st_size
+                total_files += 1
+    with drive_mounted(drive, read_only=True) as m:
+        free = shutil.disk_usage(m).free
+    part = get_part(partition)
+    pc = (windows_summary(part).get("computer_name") if part["windows"] else None) or part["name"]
+    folder = f"{pc}_{dt.date.today():%Y-%m-%d}"
+    details = [f"Copy: {total_files:,} files, {total_bytes / 1e9:.1f} GB",
+               "From: " + ", ".join(name for _, name in items),
+               f"To: {drive['label'] or drive['name']} ({drive['drive']}), {free / 1e9:.1f} GB free",
+               f"Folder: RescueAI-Backup/{folder}"]
+    if total_bytes > free:
+        details.append("WARNING: not enough free space; the backup will stop when the drive is full.")
+    if drive["fstype"] == "vfat":
+        details.append("The drive uses FAT32: files over 4 GB will be skipped.")
+    return new_job("backup", f"Back up {total_files:,} files to a USB drive", details, "low", reason,
+                   lambda job: run_backup(job, items, drive, folder, total_files, total_bytes),
+                   reversible=None, locked=False)
+
+
+def unreadable_bytes(mapfile: Path) -> int:
+    """Bytes ddrescue could not read, from its mapfile."""
+    bad = 0
+    with contextlib.suppress(OSError):
+        lines = [ln.split() for ln in mapfile.read_text().splitlines() if ln.strip() and not ln.startswith("#")]
+        for fields in lines[1:]:  # the first line is the current position
+            if len(fields) >= 3 and fields[2] != "+":
+                bad += int(fields[1], 0)
+    return bad
+
+
+@tool(change=True)
+def request_disk_image(partition: str, destination: str, reason: str) -> dict:
+    """Ask to copy a whole partition, sector by sector, into an image file on a USB drive with GNU
+    ddrescue (it copies the readable areas first and retries damaged ones). Use it first when the disk
+    is failing. Nothing on the Windows disk changes; a BitLocker partition is copied still encrypted.
+    If it is stopped, running it again continues where it left off."""
+    part = PARTS.get(partition.removeprefix("/dev/"))
+    if not part or not part.get("device"):
+        raise UserError(f"Unknown partition {partition!r}. Known: {', '.join(PARTS) or 'none'}")
+    if not shutil.which("ddrescue"):
+        raise UserError("ddrescue is not installed on this rescue system.")
+    drive = find_backup_drive(destination)
+    size = int(run(["blockdev", "--getsize64", part["device"]]).stdout.strip() or 0)
+    with drive_mounted(drive, read_only=True) as m:
+        free = shutil.disk_usage(m).free
+    if drive["fstype"] == "vfat" and size > 4 * 2**30 - 1:
+        raise UserError("The backup drive uses FAT32, which can't hold a file over 4 GB. Use an exFAT or NTFS drive.")
+    if size > free:
+        raise UserError(f"Not enough space: the image needs {size / 1e9:.1f} GB, the drive has {free / 1e9:.1f} GB free.")
+
+    def run_fn(job):
+        with drive_mounted(drive) as mount:
+            folder = mount / "RescueAI-Backup" / "images"
+            folder.mkdir(parents=True, exist_ok=True)
+            image, mapfile = folder / f"{part['name']}.img", folder / f"{part['name']}.map"
+            proc = subprocess.Popen(["ddrescue", "-r2", part["device"], str(image), str(mapfile)],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, errors="replace")
+            while proc.poll() is None:
+                if job.get("_cancel"):
+                    proc.terminate()
+                with contextlib.suppress(OSError):
+                    job["progress"] = f"{image.stat().st_size / 1e9:.1f} of {size / 1e9:.1f} GB read"
+                time.sleep(2)
+            if job.get("_cancel"):
+                raise UserError("Cancelled. Running request_disk_image again continues where it stopped.")
+            if proc.returncode != 0:
+                raise UserError("ddrescue failed: " + clip(proc.stderr.read(), 1500, tail=True))
+            bad = unreadable_bytes(mapfile)
+        return {"image": f"RescueAI-Backup/images/{part['name']}.img", "gb": round(size / 1e9, 2),
+                "unreadable_bytes": bad, "complete": bad == 0}
+
+    details = [f"Copy: partition {part['name']} ({size / 1e9:.1f} GB), sector by sector",
+               f"To: {drive['label'] or drive['name']} ({drive['drive']}), {free / 1e9:.1f} GB free",
+               f"File: RescueAI-Backup/images/{part['name']}.img"]
+    return new_job("disk_image", f"Copy partition {part['name']} to an image file", details, "low", reason,
+                   run_fn, reversible=None, locked=False)
+
+
+@tool(locked=False)
+def cancel_job(job_id: int) -> dict:
+    """Cancel a request that is still waiting for approval, or stop a running backup or disk image.
+    Windows repairs and other changes can't be stopped safely once they are running."""
+    job = JOBS.get(job_id)
+    if not job:
+        raise UserError(f"No job {job_id} in this session.")
+    if job["state"] == "waiting_for_approval":
+        job["state"] = "cancelled"
+    elif job["state"] == "running" and job["kind"] in ("backup", "disk_image"):
+        job["_cancel"] = True
+    else:
+        raise UserError(f"Job {job_id} is {job['state']} and can't be cancelled.")
+    if SCREEN:
+        SCREEN.refresh()
+    return {"job_id": job_id, "note": "Cancelled." if job["state"] == "cancelled" else "Stopping..."}
+
+
+# ---------------------------------------------------------------- Windows' own repair tools in a small VM (M3)
+
+
+QEMU = "qemu-system-x86_64"
+OVMF_PAIRS = [("/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_VARS_4M.fd"),
+              ("/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/OVMF/OVMF_VARS.fd")]
+ESP_TYPE = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B"
+CBS_STATES = {0: "absent", 5: "uninstall pending", 16: "resolving", 32: "resolved", 48: "staging", 64: "staged",
+              80: "superseded", 96: "install pending", 101: "partially installed", 112: "installed", 128: "permanent"}
+# repair -> (title, minutes allowed with hardware virtualization, risk)
+REPAIRS = {
+    "chkdsk": ("Check and fix the Windows file system (chkdsk /f)", 60, "medium"),
+    "chkdsk_bad_sectors": ("Check the file system and scan for bad sectors (chkdsk /r)", 300, "medium"),
+    "sfc": ("Repair Windows system files (sfc /scannow)", 90, "medium"),
+    "dism_restorehealth": ("Repair Windows' component store (DISM /RestoreHealth)", 90, "medium"),
+    "dism_revert_pending": ("Undo a stuck, half-installed update (DISM /RevertPendingActions)", 60, "medium"),
+    "dism_remove_package": ("Uninstall an update (DISM /Remove-Package)", 60, "high"),
+    "dism_remove_driver": ("Remove a third-party driver (DISM /Remove-Driver)", 30, "medium"),
+    "bcdboot": ("Rebuild Windows' boot files and boot menu (bcdboot)", 15, "high"),
+}
+# Started by Windows' recovery environment instead of its usual menu (see winpeshl.ini)
+RUN_CMD = r"""@echo off
+rem Rescue AI: run the job from the job disk, save its output there, then power off.
+wpeinit
+set JOB=
+for %%d in (C D E F G H I J K L M N O P Q R S T U V W Y Z) do if exist %%d:\rescue-job.cmd set JOB=%%d:
+if not defined JOB goto off
+call %JOB%\rescue-job.cmd > %JOB%\output.txt 2>&1
+> %JOB%\exitcode.txt echo %ERRORLEVEL%
+if exist X:\Windows\Logs\DISM\dism.log copy /y X:\Windows\Logs\DISM\dism.log %JOB%\dism.log >nul
+:off
+wpeutil shutdown
+"""
+WINPESHL = "[LaunchApps]\r\n%SYSTEMROOT%\\System32\\cmd.exe, /c %SYSTEMDRIVE%\\rescue\\run.cmd\r\n"
+
+
+def repair_commands(repair: str, efi_partition: int | None, package: str, driver: str) -> str:
+    dism = "if not exist %WIN%\\RescueAI\\scratch mkdir %WIN%\\RescueAI\\scratch\n" \
+           "dism /Image:%WIN%\\ /ScratchDir:%WIN%\\RescueAI\\scratch "
+    return {
+        "chkdsk": "echo Y| chkdsk %WIN% /f /x",
+        "chkdsk_bad_sectors": "echo Y| chkdsk %WIN% /r /x",
+        "sfc": "sfc /scannow /offbootdir=%WIN%\\ /offwindir=%WIN%\\Windows",
+        "dism_restorehealth": dism + "/Cleanup-Image /RestoreHealth",
+        "dism_revert_pending": dism + "/Cleanup-Image /RevertPendingActions",
+        "dism_remove_package": dism + f"/Remove-Package /PackageName:{package}",
+        "dism_remove_driver": dism + f"/Remove-Driver /Driver:{driver}",
+        "bcdboot": f"(echo select disk 0& echo select partition {efi_partition}& echo assign letter=S) > %~d0\\dp.txt\n"
+                   "diskpart /s %~d0\\dp.txt\n"
+                   "if not exist S:\\ (\n  echo RESCUE-ERROR: the EFI system partition could not be opened.\n"
+                   "  exit /b 91\n)\nbcdboot %WIN%\\Windows /s S: /f UEFI",
+    }[repair]
+
+
+def repair_script(serial: str, commands: str) -> str:
+    """The job for Windows' recovery environment: find the Windows partition by its serial, then run."""
+    return (
+        "@echo off\nset WIN=\n"
+        "for %%d in (C D E F G H I J K L M N O P Q R S T U V W Y Z) do (\n"
+        f"  for /f \"tokens=5\" %%s in ('vol %%d: 2^>nul ^| find /i \"Serial Number\"') do "
+        f"if /i \"%%s\"==\"{serial}\" set WIN=%%d:\n)\n"
+        f"if not defined WIN (\n  echo RESCUE-ERROR: the Windows partition {serial} was not found.\n  exit /b 90\n)\n"
+        "echo Windows partition: %WIN%\n" + commands + "\n")
+
+
+def ntfs_serial(part: dict) -> str:
+    """The serial number Windows shows for the partition (vol), from its NTFS UUID."""
+    uuid = run(["blkid", "-o", "value", "-s", "UUID", part["device"]]).stdout.strip().upper()
+    if not re.fullmatch(r"[0-9A-F]{16}", uuid):
+        raise UserError("Could not read the Windows partition's serial number.")
+    return f"{uuid[8:12]}-{uuid[12:]}"
+
+
+def partition_number(part: dict) -> int:
+    n = read_sys(f"/sys/class/block/{part['name']}/partition")
+    if n and n.isdigit():
+        return int(n)
+    m = re.search(r"(\d+)$", part["name"])
+    return int(m.group(1)) if m else 0
+
+
+def find_ovmf() -> tuple[str, str] | None:
+    return next(((c, v) for c, v in OVMF_PAIRS if Path(c).exists() and Path(v).exists()), None)
+
+
+def repair_problems() -> list[str]:
+    """Anything this rescue system is missing for running Windows' repair tools."""
+    missing = [p for p in (QEMU, "wimlib-imagex", "mkfs.vfat", "mcopy", "mmd", "sfdisk", "blkid") if not shutil.which(p)]
+    if not find_ovmf():
+        missing.append("OVMF (UEFI firmware for the virtual machine)")
+    return missing
+
+
+def media_mount(drive: dict) -> Path:
+    """Mount a USB drive read-only (kept mounted) to look for Windows install files."""
+    existing = mount_info(drive["device"])
+    if existing:
+        return Path(existing[0])
+    target = MEDIA_MOUNTS / drive["name"]
+    target.mkdir(parents=True, exist_ok=True)
+    p = run(["mount", "-t", MOUNT_TYPES.get(drive["fstype"], drive["fstype"]), "-o", "ro", drive["device"], str(target)])
+    if p.returncode != 0:
+        raise UserError(p.stderr.strip())
+    return target
+
+
+def find_repair_env(part: dict) -> dict:
+    """Where Windows' recovery environment can start from: this PC's own, or a Windows install USB."""
+    root = Path(part["mountpoint"])
+    bootmgr = ci_path(root, "Windows/Boot/EFI/bootmgfw.efi")
+    bcd = ci_path(root, "Windows/Boot/DVD/EFI/BCD")
+    sdi = ci_path(root, "Windows/Boot/DVD/EFI/boot.sdi")
+    wim, where = ci_path(root, "Windows/System32/Recovery/Winre.wim"), part["name"]
+    for p in PARTS.values():
+        if p["kind"] == "ntfs" and p["mountpoint"]:
+            sdi = sdi or ci_path(Path(p["mountpoint"]), "Recovery/WindowsRE/boot.sdi")
+            if not wim:
+                wim, where = ci_path(Path(p["mountpoint"]), "Recovery/WindowsRE/Winre.wim"), p["name"]
+    if bootmgr and bcd and sdi and wim:
+        return {"wim": wim, "bootmgr": bootmgr, "bcd": bcd, "sdi": sdi,
+                "desc": f"this PC's own Windows recovery environment (on {where})"}
+    for drive in usb_partitions(MEDIA_FS):
+        with contextlib.suppress(UserError):
+            media = media_mount(drive)
+            files = [ci_path(media, r) for r in ("sources/boot.wim", "efi/boot/bootx64.efi",
+                                                 "efi/microsoft/boot/bcd", "boot/boot.sdi")]
+            if all(files):
+                return {"wim": files[0], "bootmgr": files[1], "bcd": files[2], "sdi": files[3],
+                        "desc": f"the Windows install USB {drive['label'] or drive['name']}"}
+    raise UserError("Windows' recovery environment was not found on this PC (its Winre.wim or boot files are "
+                    "missing). Ask the person to plug in a Windows 10/11 install USB (from Microsoft's Media "
+                    "Creation Tool) and try again.")
+
+
+def prepare_wim(env: dict, workdir: Path) -> Path:
+    """Copy the recovery image and make it run our job instead of its usual menu."""
+    wim = workdir / "boot.wim"
+    shutil.copyfile(env["wim"], wim)
+    m = re.search(r"Boot Index:\s*(\d+)", run(["wimlib-imagex", "info", str(wim)]).stdout)
+    index = m.group(1) if m and m.group(1) != "0" else "1"
+    (workdir / "run.cmd").write_bytes(RUN_CMD.replace("\n", "\r\n").encode())
+    (workdir / "winpeshl.ini").write_bytes(WINPESHL.encode())
+    commands = (f'add "{workdir / "run.cmd"}" /rescue/run.cmd\n'
+                f'add "{workdir / "winpeshl.ini"}" /Windows/System32/winpeshl.ini\n')
+    p = subprocess.run(["wimlib-imagex", "update", str(wim), index], input=commands, capture_output=True, text=True)
+    if p.returncode != 0:
+        raise UserError("Could not prepare Windows' recovery image: " + (p.stderr or p.stdout).strip())
+    return wim
+
+
+def fat_image(path: Path, size_mb: int, esp: bool, files: dict[str, Path]) -> None:
+    """A disk image with one FAT32 partition (a GPT EFI system partition, or an MBR data partition)."""
+    with open(path, "wb") as f:
+        f.truncate(size_mb * 2**20)
+    table = f"label: gpt\nstart=2048, type={ESP_TYPE}\n" if esp else "label: dos\nstart=2048, type=c\n"
+    p = subprocess.run(["sfdisk", "-q", str(path)], input=table, capture_output=True, text=True)
+    if p.returncode != 0:
+        raise UserError("Could not create a disk image: " + p.stderr.strip())
+    p = run(["mkfs.vfat", "-F", "32", "--offset", "2048", str(path), str((size_mb - 2) * 1024)])
+    if p.returncode != 0:
+        raise UserError("Could not format a disk image: " + (p.stderr or p.stdout).strip())
+    image = f"{path}@@1M"
+    for dest, src in files.items():
+        folder = ""
+        for name in dest.strip("/").split("/")[:-1]:
+            folder += "/" + name
+            run(["mmd", "-i", image, "::" + folder])  # fails harmlessly if it exists
+        p = run(["mcopy", "-o", "-i", image, str(src), "::" + dest])
+        if p.returncode != 0:
+            raise UserError(f"Could not copy {dest} into a disk image: {p.stderr.strip()}")
+
+
+def read_from_image(path: Path, name: str) -> bytes | None:
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "file"
+        p = run(["mcopy", "-n", "-i", f"{path}@@1M", "::/" + name, str(out)])
+        return out.read_bytes() if p.returncode == 0 and out.exists() else None
+
+
+@contextlib.contextmanager
+def disk_for_vm(disk: str, job: dict):
+    """Hand a whole disk to the repair VM: unmount its partitions and make it writable. Afterwards its
+    partitions are always read-only and mounted again."""
+    parts = [p for p in PARTS.values() if p.get("disk") == disk]
+    disk_dev = f"/dev/{disk}"
+    devices = [disk_dev] + [p["device"] for p in parts if p["device"] != disk_dev]
+    was_ro = run(["blockdev", "--getro", disk_dev]).stdout.strip() == "1"
+
+    def remount():
+        for p in parts:
+            if p["kind"] == "bitlocker":
+                p["note"] = "BitLocker-encrypted and locked (needs the recovery key to read)"
+            elif not p.get("mountpoint"):
+                p["mountpoint"], p["note"] = mount_readonly(p["device"], p["name"], p["kind"])
+        release_caches()
+
+    WARMED.wait(120)
+    with _LOCK:
+        release_caches()
+        for p in parts:
+            if p.get("mountpoint") and run(["umount", p["mountpoint"]]).returncode != 0:
+                remount()
+                raise UserError(f"{p['name']} is in use (maybe a shell on screen 2 is inside it). Close it and try again.")
+            p["mountpoint"], p["note"] = None, f"in use by Windows' repair tool (job {job['id']})"
+    try:
+        for dev in devices:
+            run(["blockdev", "--flushbufs", dev])
+            run(["blockdev", "--setrw", dev])
+        yield disk_dev
+    finally:
+        with _LOCK:
+            for dev in reversed(devices):
+                run(["blockdev", "--flushbufs", dev])  # drop anything cached from before the repair
+                if dev != disk_dev or was_ro:
+                    run(["blockdev", "--setro", dev])
+            remount()
+
+
+def run_vm(disk_dev: str, boot_img: Path, job_img: Path, minutes: int, workdir: Path) -> None:
+    code, vars_template = find_ovmf()
+    vars_copy = workdir / "vars.fd"
+    shutil.copyfile(vars_template, vars_copy)
+    kvm = os.access("/dev/kvm", os.R_OK | os.W_OK)
+    m = re.search(r"MemTotal:\s+(\d+)", read_sys("/proc/meminfo") or "")
+    memory = "3072" if m and int(m.group(1)) > 7_000_000 else "2048"
+    cmd = [QEMU, "-machine", f"q35,accel={'kvm' if kvm else 'tcg'}", "-cpu", "host" if kvm else "max",
+           "-m", memory, "-smp", "2", "-no-reboot", "-display", "none", "-nic", "none",
+           "-drive", f"if=pflash,format=raw,readonly=on,file={code}",
+           "-drive", f"if=pflash,format=raw,file={vars_copy}",
+           "-device", "ahci,id=ahci",
+           "-drive", f"file={disk_dev},format=raw,if=none,id=windows,cache=none",
+           "-device", "ide-hd,drive=windows,bus=ahci.0",
+           "-drive", f"file={boot_img},format=raw,if=none,id=boot",
+           "-device", "ide-hd,drive=boot,bus=ahci.1,bootindex=0",
+           "-drive", f"file={job_img},format=raw,if=none,id=job",
+           "-device", "ide-hd,drive=job,bus=ahci.2"]
+    log_file = workdir / "qemu.log"
+    with open(log_file, "w") as out:
+        proc = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT)
+        try:
+            proc.wait(timeout=minutes * 60)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            raise UserError(f"Windows' repair tool didn't finish within {minutes} minutes and was stopped.")
+    if proc.returncode != 0:
+        raise UserError("The repair virtual machine failed: " + clip(log_file.read_text(errors="replace"), 1500, tail=True))
+
+
+def run_windows_repair(job: dict, part: dict, repair: str, env: dict, script: str, minutes: int) -> dict:
+    workdir = Path(tempfile.mkdtemp(prefix="rescue-repair-"))
+    try:
+        job["progress"] = "Preparing Windows' recovery environment..."
+        wim = prepare_wim(env, workdir)
+        boot_img = workdir / "boot.img"
+        fat_image(boot_img, wim.stat().st_size // 2**20 + 64, True,
+                  {"/EFI/Boot/bootx64.efi": env["bootmgr"], "/EFI/Microsoft/Boot/BCD": env["bcd"],
+                   "/boot/boot.sdi": env["sdi"], "/sources/boot.wim": wim})
+        wim.unlink()  # it's inside boot.img now; free the memory
+        script_file = workdir / "rescue-job.cmd"
+        script_file.write_bytes(script.replace("\n", "\r\n").encode())
+        job_img = workdir / "job.img"
+        fat_image(job_img, 100, False, {"/rescue-job.cmd": script_file})
+        with disk_for_vm(part["disk"], job) as disk_dev:
+            job["progress"] = f"Windows' repair tool is running (started {dt.datetime.now():%H:%M})"
+            if SCREEN:
+                SCREEN.refresh()
+            run_vm(disk_dev, boot_img, job_img, minutes, workdir)
+        output = decode_text(read_from_image(job_img, "output.txt") or b"") or ""
+        code = (read_from_image(job_img, "exitcode.txt") or b"").decode(errors="replace").strip()
+        if not code:
+            raise UserError("Windows' recovery environment started but didn't report a result. "
+                            "Output so far: " + (clip(output, 2000, tail=True) or "(none)"))
+        if "RESCUE-ERROR" in output:
+            raise UserError(next(ln for ln in output.splitlines() if "RESCUE-ERROR" in ln).split(":", 1)[1].strip())
+        result = {"repair": repair, "exit_code": int(code) if code.lstrip("-").isdigit() else code,
+                  "output": clip(output, 20_000, tail=True)}
+        dism_log = decode_text(read_from_image(job_img, "dism.log") or b"")
+        if dism_log:
+            result["dism_log_end"] = clip(dism_log, 6000, tail=True)
+        return result
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+@tool
+def list_installed_updates(partition: str = "", limit: int = 40) -> dict:
+    """Windows updates known to the component store, newest first, with their state ("install pending"
+    or "partially installed" marks a stuck update). Use a package name with
+    request_windows_repair("dism_remove_package", package=...)."""
+    part = get_part(partition)
+    top = hive_root(open_hive(ci_path(Path(part["mountpoint"]), "Windows/System32/config/SOFTWARE")))
+    packages = subkey(top, "Microsoft/Windows/CurrentVersion/Component Based Servicing/Packages")
+    items = []
+    for k in packages.iter_subkeys():
+        if not k.name.lower().startswith("package_for_"):
+            continue
+        v = reg_values(k)
+        high, low = v.get("InstallTimeHigh"), v.get("InstallTimeLow")
+        when = filetime((high << 32) | low) if isinstance(high, int) and isinstance(low, int) else key_time(k)
+        items.append({"package": k.name, "state": CBS_STATES.get(v.get("CurrentState"), v.get("CurrentState")),
+                      "installed": when})
+    items.sort(key=lambda i: i["installed"] or "", reverse=True)
+    stuck = [i for i in items if i["state"] in ("install pending", "uninstall pending", "partially installed")]
+    return {"stuck": stuck[:20] or "none", "recent": items[:max(1, min(limit, 200))]}
+
+
+def inf_info(text: str) -> dict:
+    section, version, strings = "", {}, {}
+    for line in text.splitlines():
+        line = line.split(";", 1)[0].strip()
+        if m := re.match(r"^\[(.+)\]$", line):
+            section = m.group(1).strip().lower()
+        elif "=" in line and (section == "version" or section.startswith("strings")):
+            key, value = line.split("=", 1)
+            (version if section == "version" else strings)[key.strip().lower()] = value.strip().strip('"')
+
+    def expand(value):
+        return re.sub(r"%([^%]+)%", lambda m: strings.get(m.group(1).lower(), m.group(0)), value or "")
+
+    date, _, ver = (version.get("driverver") or "").partition(",")
+    if m := re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{4})", date.strip()):
+        date = f"{m.group(3)}-{int(m.group(1)):02d}-{int(m.group(2)):02d}"
+    return {"provider": expand(version.get("provider")), "class": expand(version.get("class")),
+            "driver_date": date.strip(), "version": ver.strip()}
+
+
+@tool
+def list_third_party_drivers(partition: str = "") -> dict:
+    """Third-party drivers in Windows' driver store (oemNN.inf), newest first: provider, type, version,
+    and when they were added. Use an oemNN.inf name with request_windows_repair("dism_remove_driver", driver=...)."""
+    part = get_part(partition)
+    inf = ci_path(Path(part["mountpoint"]), "Windows/INF")
+    drivers = []
+    for name in sorted(n for n in (os.listdir(inf) if inf else []) if re.fullmatch(r"(?i)oem\d+\.inf", n)):
+        f = inf / name
+        with contextlib.suppress(OSError):
+            drivers.append({"inf": name, "added": mtime_str(f), **inf_info(read_text(f, 300_000) or "")})
+    drivers.sort(key=lambda d: d["added"], reverse=True)
+    return {"count": len(drivers), "drivers": drivers}
+
+
+@tool
+def check_repair_tools(partition: str = "") -> dict:
+    """Can Windows' own repair tools (chkdsk, sfc, DISM, bcdboot) run here? Shows where Windows' recovery
+    environment would come from, whether hardware virtualization is on (speed), memory, and anything missing."""
+    part = get_part(partition)
+    try:
+        env = find_repair_env(part)["desc"]
+    except UserError as e:
+        env = f"NOT FOUND. {e}"
+    m = re.search(r"MemTotal:\s+(\d+)", read_sys("/proc/meminfo") or "")
+    kvm = os.access("/dev/kvm", os.R_OK | os.W_OK)
+    return {"recovery_environment": env,
+            "hardware_virtualization": "on (full speed)" if kvm else "off: very slow; turn on VT-x / AMD-V (SVM) in the BIOS",
+            "ram_gb": round(int(m.group(1)) / 1e6, 1) if m else None,
+            "missing_on_rescue_system": repair_problems() or "nothing",
+            "windows_hibernated": hibernated(Path(part["mountpoint"])),
+            "uefi_pc": Path("/sys/firmware/efi").exists()}
+
+
+@tool(change=True)
+def request_windows_repair(repair: str, reason: str, partition: str = "", package: str = "", driver: str = "") -> dict:
+    """Ask to run one of Windows' own repair tools on the Windows partition (approved on the PC's screen).
+
+    repair: chkdsk, chkdsk_bad_sectors, sfc, dism_restorehealth, dism_revert_pending,
+    dism_remove_package (with package= from list_installed_updates), dism_remove_driver (with driver=
+    an oemNN.inf from list_third_party_drivers) or bcdboot (rebuild boot files and boot menu; UEFI PCs).
+    Windows' recovery environment (the PC's own, or a plugged-in install USB) starts in a small virtual
+    machine with the Windows disk attached, runs the command and returns its output. Call
+    check_repair_tools first. It takes minutes to an hour; poll get_job_status about once a minute.
+    Not reversible: offer request_backup first."""
+    if repair not in REPAIRS:
+        raise UserError(f"repair must be one of: {', '.join(REPAIRS)}")
+    part = get_part(partition)
+    check_can_change(part)
+    if not part["windows"]:
+        raise UserError(f"{part['name']} doesn't hold a Windows installation.")
+    if not part.get("device") or not part.get("disk"):
+        raise UserError("Windows repairs need a real disk.")
+    if hibernated(Path(part["mountpoint"])):
+        raise UserError("Windows is hibernated; its repair tools would damage it. Use request_clear_hibernation first.")
+    if problems := repair_problems():
+        raise UserError("This rescue system is missing: " + ", ".join(problems))
+    m = re.search(r"MemTotal:\s+(\d+)", read_sys("/proc/meminfo") or "")
+    if m and int(m.group(1)) < 3_500_000:
+        raise UserError("This PC has less than 4 GB of memory, too little to run Windows' repair tools here.")
+    title, minutes, risk = REPAIRS[repair]
+    efi_number = None
+    if repair == "bcdboot":
+        if not Path("/sys/firmware/efi").exists():
+            raise UserError("bcdboot here supports UEFI PCs only, and this PC started in legacy BIOS mode.")
+        efi = next((p for p in PARTS.values() if p["kind"] == "efi" and p.get("disk") == part["disk"]), None)
+        if not efi:
+            raise UserError("There's no EFI system partition on the Windows disk, and bcdboot needs one.")
+        efi_number = partition_number(efi)
+    if repair == "dism_remove_package" and not re.fullmatch(r"[A-Za-z0-9_.~-]+", package):
+        raise UserError("Give package=, a package name from list_installed_updates.")
+    if repair == "dism_remove_driver" and not (re.fullmatch(r"(?i)oem\d+\.inf", driver)
+                                               and ci_path(Path(part["mountpoint"]), f"Windows/INF/{driver}")):
+        raise UserError("Give driver=, an oemNN.inf name from list_third_party_drivers.")
+    env = find_repair_env(part)
+    commands = repair_commands(repair, efi_number, package, driver)
+    script = repair_script(ntfs_serial(part), commands)
+    kvm = os.access("/dev/kvm", os.R_OK | os.W_OK)
+    shown = commands.strip().splitlines()[-1].replace("%WIN%", "C:").replace("echo Y| ", "")
+    details = [f"Runs: {shown}",
+               f"On: the Windows partition {part['name']}; the whole disk {part['disk']} is handed to Windows' tool "
+               "while it runs, and Claude can't read it meanwhile",
+               f"Using: {env['desc']}",
+               f"Time: up to {minutes} minutes" + ("" if kvm else " x6, because hardware virtualization is off "
+                                                   "(turn on VT-x / AMD-V in the BIOS for full speed)"),
+               "Back up important files first."]
+    if package:
+        details.insert(1, f"Update to remove: {package}")
+    if driver:
+        details.insert(1, f"Driver to remove: {driver}")
+    return new_job("windows_repair", title, details, risk, reason,
+                   lambda job: run_windows_repair(job, part, repair, env, script, minutes if kvm else minutes * 6),
+                   reversible=False, locked=False)
+
+
 # ---------------------------------------------------------------- server
 
 
@@ -2119,8 +2909,10 @@ class Screen:
             for d in job["details"]:
                 lines += wrapped(d, 5)
             lines += wrapped(f"Reason given by the AI: {job['ai_reason']}", 3)
-            lines += ["   " + ("Can be undone later." if job["reversible"] else "This cannot be undone."), "",
-                      "   Press Y to approve or N to reject.", "!" * cols, ""]
+            lines += ["   " + undo_text(job), "", "   Press Y to approve or N to reject.", "!" * cols, ""]
+        elif running := next((j for j in JOBS.values() if j["state"] == "running"), None):
+            lines += wrapped(f"Working on: {running['title']}", 1)
+            lines += wrapped(running.get("progress") or "", 3) + [""]
         elif url:
             lines.append(" Add this link to Claude (Settings > Connectors > Add custom connector):")
             lines += ["   " + url[i:i + cols - 4] for i in range(0, len(url), cols - 4)]

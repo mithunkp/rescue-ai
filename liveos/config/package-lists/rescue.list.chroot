@@ -17,6 +17,16 @@ python3
 python3-venv
 python3-hivex
 
+# Backups: disk images of failing disks
+gddrescue
+
+# Windows' own repair tools run in a small VM started from the PC's recovery image
+qemu-system-x86
+ovmf
+wimtools
+mtools
+fdisk
+
 # Disk and boot tools the agent uses
 smartmontools
 nvme-cli
