@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+rescue-ai.log
+
+# live-build output and generated config
+liveos/.build/
+liveos/cache/
+liveos/chroot/
+liveos/binary/
+liveos/local/
+liveos/chroot.*
+liveos/*.iso
+liveos/*.sha256
+liveos/*.contents
+liveos/*.files
+liveos/*.packages
+liveos/config/*
+!liveos/config/package-lists/
+!liveos/config/hooks/
+!liveos/config/includes.chroot/
+# copied in from agent/ by build.sh
+liveos/config/includes.chroot/opt/rescue-ai/

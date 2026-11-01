@@ -1,0 +1,2 @@
+# Linux scripts break with Windows line endings
+* text=auto eol=lf

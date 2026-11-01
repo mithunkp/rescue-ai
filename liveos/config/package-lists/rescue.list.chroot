@@ -1,0 +1,38 @@
+# Live system basics (listed because recommended packages are turned off)
+live-boot
+live-config
+live-config-systemd
+user-setup
+sudo
+
+# Network: wired DHCP (Wi-Fi can be added later) and clock sync for the secure link
+network-manager
+systemd-timesyncd
+ca-certificates
+firmware-realtek
+firmware-linux-free
+
+# Rescue agent runtime
+python3
+python3-venv
+
+# Disk and boot tools the agent uses
+smartmontools
+nvme-cli
+ntfs-3g
+cryptsetup-bin
+dosfstools
+efibootmgr
+mokutil
+iproute2
+
+# Hardware information
+pciutils
+usbutils
+dmidecode
+lshw
+lm-sensors
+
+# For troubleshooting on screen 2 (Alt+F2)
+nano
+less

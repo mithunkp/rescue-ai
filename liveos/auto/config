@@ -1,0 +1,19 @@
+#!/bin/sh
+# live-build settings for the Rescue AI USB (Debian 13 "trixie").
+# Only packages, files and settings are added: Debian's signed boot loader and
+# kernel stay unchanged, so the USB boots with Secure Boot on.
+set -e
+
+lb config noauto \
+	--distribution trixie \
+	--archive-areas "main contrib non-free-firmware" \
+	--binary-images iso-hybrid \
+	--debian-installer none \
+	--apt-recommends false \
+	--uefi-secure-boot enable \
+	--firmware-binary false \
+	--firmware-chroot false \
+	--iso-application "Rescue AI" \
+	--iso-volume "RESCUE_AI" \
+	--bootappend-live "boot=live components quiet loglevel=3 nomodeset hostname=rescue-ai" \
+	"${@}"

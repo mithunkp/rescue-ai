@@ -1,0 +1,16 @@
+#!/bin/sh
+# Bake the Rescue AI agent into the image, so nothing is downloaded at the broken PC.
+set -e
+
+python3 -m venv /opt/rescue-ai/.venv
+/opt/rescue-ai/.venv/bin/pip install --no-cache-dir --disable-pip-version-check \
+	-r /opt/rescue-ai/requirements.txt evtx
+
+# cloudflared opens the secure link
+python3 -c "import urllib.request; urllib.request.urlretrieve('https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb', '/tmp/cloudflared.deb')"
+dpkg -i /tmp/cloudflared.deb
+rm -f /tmp/cloudflared.deb
+
+# Screen 1 shows Rescue AI instead of a login prompt
+systemctl mask getty@tty1.service
+systemctl enable rescue-agent.service NetworkManager.service systemd-timesyncd.service
