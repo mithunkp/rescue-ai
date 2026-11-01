@@ -61,6 +61,7 @@ img = work / "win.img"
 sh("truncate", "-s", "300M", str(img))
 sh("mkntfs", "-F", "-Q", "-L", "TESTWIN", str(img))
 dev = sh("losetup", "-f", "--show", str(img)).stdout.strip()
+sh("blockdev", "--setrw", dev)  # a reused loop device can keep an earlier read-only flag
 ra.MOUNT_BASE = work / "rescue"
 try:
     staging = work / "staging"
@@ -140,4 +141,5 @@ try:
     print("ALL LINUX CHANGE TESTS PASSED")
 finally:
     sh("umount", "-l", str(ra.MOUNT_BASE / Path(dev).name), check=False)
+    sh("blockdev", "--setrw", dev, check=False)
     sh("losetup", "-d", dev, check=False)

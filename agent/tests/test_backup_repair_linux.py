@@ -102,6 +102,7 @@ try:
     sh("mkntfs", "-F", "-Q", "-L", "WINDOWS", str(win_img))
     win_dev = sh("losetup", "-f", "--show", str(win_img)).stdout.strip()
     devices.append(win_dev)
+    sh("blockdev", "--setrw", win_dev)  # a reused loop device can keep an earlier test's read-only flag
     staging = work / "staging"
     staging.mkdir()
     sh("mount", "-t", "ntfs-3g", win_dev, str(staging))
@@ -126,6 +127,7 @@ try:
     sh("mkfs.vfat", "-F", "32", "-n", "RESCUEUSB", str(usb_img))
     usb_dev = sh("losetup", "-f", "--show", str(usb_img)).stdout.strip()
     devices.append(usb_dev)
+    sh("blockdev", "--setrw", usb_dev)
 
     ra.MOUNT_BASE, ra.BACKUP_MOUNTS, ra.MEDIA_MOUNTS = work / "rescue", work / "backup", work / "media"
     name = Path(win_dev).name
@@ -213,4 +215,5 @@ finally:
         if p.get("mountpoint"):
             sh("umount", "-l", p["mountpoint"], check=False)
     for dev in devices:
+        sh("blockdev", "--setrw", dev, check=False)
         sh("losetup", "-d", dev, check=False)
