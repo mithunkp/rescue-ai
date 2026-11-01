@@ -2,7 +2,8 @@
 # Bake the Rescue AI agent into the image, so nothing is downloaded at the broken PC.
 set -e
 
-python3 -m venv /opt/rescue-ai/.venv
+# --system-site-packages lets the agent use Debian's python3-hivex
+python3 -m venv --system-site-packages /opt/rescue-ai/.venv
 /opt/rescue-ai/.venv/bin/pip install --no-cache-dir --disable-pip-version-check \
 	-r /opt/rescue-ai/requirements.txt evtx
 

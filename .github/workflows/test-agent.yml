@@ -1,0 +1,25 @@
+name: Test agent on Linux
+
+on:
+  push:
+    paths: ["agent/**", ".github/workflows/test-agent.yml"]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ntfs-3g python3-hivex python3-venv
+
+      - name: Python environment
+        run: |
+          python3 -m venv --system-site-packages .venv
+          .venv/bin/pip install -q -r agent/requirements.txt evtx
+
+      - name: Approved changes on a real NTFS disk image
+        run: sudo .venv/bin/python agent/tests/test_changes_linux.py

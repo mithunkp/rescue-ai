@@ -12,9 +12,10 @@ ca-certificates
 firmware-realtek
 firmware-linux-free
 
-# Rescue agent runtime
+# Rescue agent runtime (hivex edits the offline Windows registry)
 python3
 python3-venv
+python3-hivex
 
 # Disk and boot tools the agent uses
 smartmontools

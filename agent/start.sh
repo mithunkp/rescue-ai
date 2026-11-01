@@ -20,9 +20,10 @@ if ! python3 -c "import urllib.request; urllib.request.urlopen('https://pypi.org
 fi
 
 echo "[2/4] Installing system tools..."
-if ! command -v smartctl >/dev/null || ! python3 -c "import ensurepip" 2>/dev/null; then
+if ! command -v smartctl >/dev/null || ! python3 -c "import ensurepip, hivex" 2>/dev/null; then
   apt-get update -qq
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends smartmontools python3-venv >/dev/null
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+    smartmontools python3-venv python3-hivex ntfs-3g >/dev/null
 fi
 
 echo "[3/4] Setting up Python packages (the first run takes a minute)..."
@@ -31,7 +32,7 @@ if [ "$SRC" != "$APP" ]; then
   cp "$SRC/rescue_agent.py" "$SRC/requirements.txt" "$APP/"
 fi
 if [ ! -x "$APP/.venv/bin/python" ]; then
-  python3 -m venv "$APP/.venv"
+  python3 -m venv --system-site-packages "$APP/.venv"  # so the agent can use python3-hivex
 fi
 "$APP/.venv/bin/pip" install -q --disable-pip-version-check -r "$APP/requirements.txt"
 if ! "$APP/.venv/bin/pip" install -q --disable-pip-version-check evtx 2>/dev/null; then

@@ -10,12 +10,16 @@ Normally started by start.sh, which installs the dependencies first.
 
 import argparse
 import collections
+import contextlib
 import datetime as dt
 import fnmatch
 import functools
+import hashlib
+import itertools
 import json
 import logging
 import os
+import queue
 import re
 import secrets
 import shutil
@@ -23,6 +27,8 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
+import textwrap
 import threading
 import time
 import xml.etree.ElementTree as ET
@@ -148,7 +154,7 @@ DIAGNOSTICS = {
 INSTRUCTIONS = r"""
 You are connected to Rescue AI, running on a PC that was started from a Linux
 live USB so its Windows installation can be examined from the outside.
-Windows is NOT running. Everything is READ-ONLY: you can inspect, not change.
+Windows is NOT running.
 
 How to work:
 1. Call get_overview first. Ask the person what they see when Windows starts
@@ -158,9 +164,18 @@ How to work:
    Useful files: Windows\System32\LogFiles\Srt\SrtTrail.txt (Automatic Repair),
    Windows\Logs\CBS\CBS.log, Windows\INF\setupapi.dev.log, Windows\Panther\.
 3. Explain the most likely cause in plain language and show your evidence.
-4. Give fix steps the person can do themselves (for example from the Windows
-   Recovery Environment), one step at a time. Warn before anything that could
-   lose data. If disk health is bad, tell them to copy important files first.
+4. Fix it:
+   - Tools named request_* ask to change the PC. Nothing changes until the
+     person at the PC presses Y on its screen. After a request, tell them what
+     you asked for and why, then call get_job_status about every 20 seconds.
+     Never send the same request twice.
+   - Prefer the smallest change. Changes can be reverted with request_undo,
+     except clearing hibernation and commands.
+   - Repairs that need Windows' own tools (SFC, DISM, bcdboot, chkdsk) can't run
+     here yet: give the person step-by-step instructions for the Windows
+     Recovery Environment instead.
+   - request_run_command only works after the person turns on Expert mode.
+   - If disk health is bad, change nothing: tell them to copy their files first.
 
 Notes:
 - Event-log "days" count back from the newest event in that log, because the
@@ -168,7 +183,8 @@ Notes:
 - Paths are relative to a partition (default: the Windows partition); drive
   letters such as C: are ignored.
 - Personal files under \Users are private unless the owner allowed them.
-- Never ask for passwords or BitLocker recovery keys in chat.
+- Never ask for passwords or BitLocker recovery keys in chat, and never try to
+  reset or bypass Windows passwords.
 """
 
 security = {}
@@ -186,17 +202,23 @@ mcp = FastMCP(
     **security,
 )
 READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False)
+CHANGES = ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False)
 
 
 class UserError(Exception):
     """A problem the AI can act on; returned to it as {"error": ...}."""
 
 
-def tool(fn):
-    """Register fn as a read-only MCP tool, log each call, and catch errors."""
+def tool(fn=None, *, change: bool = False, locked: bool = True):
+    """Register fn as an MCP tool, log each call, and catch errors.
+
+    change=True marks request_* tools: they only create a job that the person
+    at the PC must approve. locked=False lets a tool answer while a change runs."""
+    if fn is None:
+        return functools.partial(tool, change=change, locked=locked)
 
     def call(kwargs):
-        with _LOCK:
+        with _LOCK if locked else contextlib.nullcontext():
             try:
                 result = fn(**kwargs)
             except UserError as e:
@@ -223,7 +245,7 @@ def tool(fn):
         log.info("AI -> %s(%s)", fn.__name__, shown)
         return await anyio.to_thread.run_sync(call, kwargs)
 
-    return mcp.tool(annotations=READ_ONLY)(wrapper)
+    return mcp.tool(annotations=CHANGES if change else READ_ONLY)(wrapper)
 
 
 # ---------------------------------------------------------------- helpers
@@ -395,6 +417,7 @@ def discover() -> None:
     for disk in disks():
         if disk.get("tran") == "usb":  # the live USB itself, or a backup stick
             continue
+        failing = None
         for part in disk.get("children") or []:
             fstype = (part.get("fstype") or "").lower()
             ptype = (part.get("parttype") or "").lower()
@@ -406,10 +429,12 @@ def discover() -> None:
                 kind = "bitlocker"
             else:
                 continue
+            if failing is None:
+                failing = smart_quick(disk["path"]) == "FAILED"
             info = {
                 "name": part["name"], "device": part["path"], "disk": disk["name"], "kind": kind,
                 "label": part.get("label") or part.get("partlabel"), "size_gb": gb(part.get("size")),
-                "mountpoint": None, "note": "", "windows": False,
+                "mountpoint": None, "note": "", "windows": False, "disk_failed": failing,
             }
             if kind == "bitlocker":
                 info["note"] = "BitLocker-encrypted and locked (needs the recovery key to read)"
@@ -427,7 +452,7 @@ def add_test_root(path: str) -> None:
     kind = "efi" if not windows and ci_path(root, "EFI") else "ntfs"
     PARTS[name] = {
         "name": name, "device": None, "disk": None, "kind": kind, "label": root.name,
-        "size_gb": 0.0, "mountpoint": str(root), "note": "", "windows": windows,
+        "size_gb": 0.0, "mountpoint": str(root), "note": "", "windows": windows, "disk_failed": False,
     }
 
 
@@ -481,6 +506,9 @@ def check_readable(part: dict, target: Path) -> None:
 _HIVES: dict[str, object] = {}
 
 
+HIVE_COPIES = Path(tempfile.gettempdir()) / "rescue-ai-hives"
+
+
 def open_hive(path: Path | None):
     if path is None:
         raise UserError("Hive file not found")
@@ -488,7 +516,12 @@ def open_hive(path: Path | None):
 
     key = str(path)
     if key not in _HIVES:
-        _HIVES[key] = RegistryHive(key)
+        # Read a copy, so no file stays open on the Windows partition: it must be
+        # possible to unmount it when a change is approved.
+        HIVE_COPIES.mkdir(parents=True, exist_ok=True)
+        copy = HIVE_COPIES / f"{hashlib.sha1(key.encode()).hexdigest()[:12]}-{path.name}"
+        shutil.copyfile(path, copy)
+        _HIVES[key] = RegistryHive(str(copy))
     return _HIVES[key]
 
 
@@ -805,6 +838,8 @@ def get_overview() -> dict:
         "windows_installs": windows,
         "red_flags": flags or ["None found by the quick check."],
         "personal_files_shared": ALLOW_PERSONAL,
+        "changes": "each request_* change needs Y on the PC's screen; expert mode (commands) is "
+                   + ("ON" if EXPERT else "off"),
         "next_steps": "Ask what the person sees at start-up, then use crash_history, boot_check, "
                       "query_event_log (System, levels critical/error) and recent_updates.",
     }
@@ -1176,10 +1211,7 @@ def read_registry(hive: str, key: str = "", partition: str = "", max_items: int 
         raise UserError(f"Hive {hive} was not found on this PC.")
     top = hive_root(open_hive(path))
 
-    key_path = re.sub(r"^(HKLM|HKEY_LOCAL_MACHINE)[\\/]+", "", key.strip(), flags=re.I)
-    key_path = re.sub(rf"^{re.escape(upper.split(':')[0])}[\\/]+", "", key_path, flags=re.I)
-    if upper == "SYSTEM":
-        key_path = re.sub(r"(?i)^CurrentControlSet", control_set(top), key_path)
+    key_path = normalize_key(upper, key, top)
     k = subkey(top, key_path) if key_path else top
     max_items = max(1, min(max_items, 500))
     subkeys = [s.name for s in k.iter_subkeys()]
@@ -1258,6 +1290,613 @@ def battery_info() -> str:
     return "\n\n".join(found) or "No battery or power-supply information found."
 
 
+# ---------------------------------------------------------------- changes (each one approved at the PC)
+
+
+EXPERT = False  # the owner turns this on with E on the screen; it allows request_run_command
+JOBS: dict[int, dict] = {}
+_JOB_IDS = itertools.count(1)
+_APPROVED: queue.Queue = queue.Queue()
+JOB_EXPIRY_SECONDS = 15 * 60
+WARMED = threading.Event()  # set when background event-log indexing is done
+REG_TYPES = {"REG_SZ": 1, "REG_EXPAND_SZ": 2, "REG_BINARY": 3, "REG_DWORD": 4, "REG_MULTI_SZ": 7, "REG_QWORD": 11}
+WRITABLE_HIVES = ("SYSTEM", "SOFTWARE", "DEFAULT")
+# Drivers Windows can't start without: disabling one puts a warning on the approval card.
+CRITICAL_DRIVERS = {
+    "acpi", "pci", "disk", "partmgr", "volmgr", "volmgrx", "volume", "mountmgr", "ntfs", "refs", "fltmgr",
+    "storahci", "stornvme", "storport", "iastorvd", "iastorav", "iastora", "vmd", "classpnp", "ksecdd",
+    "cng", "wdf01000", "fvevol", "volsnap", "spaceport", "pdc", "msrpc", "tm", "clfs",
+}
+
+
+def job_view(job: dict) -> dict:
+    return {k: v for k, v in job.items() if not k.startswith("_")}
+
+
+def pending_jobs() -> list[dict]:
+    """Jobs waiting for the person at the PC, oldest first (expired ones are marked on the way)."""
+    waiting = []
+    for job in JOBS.values():
+        if job["state"] == "waiting_for_approval":
+            if time.time() - job["_created"] > JOB_EXPIRY_SECONDS:
+                job["state"] = "expired"
+            else:
+                waiting.append(job)
+    return waiting
+
+
+def print_card(job: dict) -> None:
+    bar = "!" * 74
+    lines = [bar, f"  CLAUDE ASKS TO CHANGE THIS PC  (job {job['id']}, risk: {job['risk']})", f"  {job['title']}"]
+    lines += [f"    {d}" for d in job["details"]]
+    lines += [f"  Reason given by the AI: {job['ai_reason']}",
+              "  " + ("Can be undone later." if job["reversible"] else "This cannot be undone."),
+              "  Press Y to approve or N to reject.", bar]
+    print("\a\n" + "\n".join(lines), flush=True)
+
+
+def new_job(kind: str, title: str, details: list[str], risk: str, reason: str, run_fn,
+            reversible: bool = True) -> dict:
+    """Queue a change for approval on the PC's screen. run_fn(job) does the work once approved."""
+    job = {"id": next(_JOB_IDS), "kind": kind, "title": title, "details": details, "risk": risk,
+           "reversible": reversible, "ai_reason": reason, "state": "waiting_for_approval",
+           "requested_at": dt.datetime.now().strftime("%H:%M:%S"), "result": None,
+           "_run": run_fn, "_created": time.time(), "_undo": None}
+    JOBS[job["id"]] = job
+    ACTIVITY.append(f"{job['requested_at']}  AI ASKS TO CHANGE: {title} (job {job['id']})")
+    log.info("Job %d requested: %s | %s | reason: %s", job["id"], title, " | ".join(details), reason)
+    if SCREEN:
+        SCREEN.refresh()
+    else:
+        print_card(job)
+    return {"job_id": job["id"], "state": job["state"],
+            "note": "Nothing has changed yet. The person at the PC must press Y on its screen to approve. "
+                    "Tell them what you asked for and why, then check get_job_status every ~20 seconds."}
+
+
+def decide(approve: bool) -> None:
+    """The person at the PC pressed Y or N: decide the oldest waiting job."""
+    waiting = pending_jobs()
+    if not waiting:
+        return
+    job = waiting[0]
+    job["state"] = "approved" if approve else "rejected"
+    job["decided_at"] = dt.datetime.now().strftime("%H:%M:%S")
+    word = "APPROVED" if approve else "rejected"
+    ACTIVITY.append(f"{job['decided_at']}  Owner {word} job {job['id']}: {job['title']}")
+    log.info("Job %d %s at the PC", job["id"], word)
+    if not SCREEN:
+        print(f"  Job {job['id']} {word}.", flush=True)
+    if approve:
+        _APPROVED.put(job["id"])
+
+
+def run_job(job: dict) -> None:
+    job["state"] = "running"
+    if SCREEN:
+        SCREEN.refresh()
+    with _LOCK:
+        try:
+            job["result"] = job["_run"](job) or {}
+            job["state"] = "done"
+        except UserError as e:
+            job["state"], job["result"] = "failed", {"error": str(e)}
+        except Exception as e:
+            log.exception("Job %d failed", job["id"])
+            job["state"], job["result"] = "failed", {"error": f"{type(e).__name__}: {e}"}
+    line = f"{dt.datetime.now():%H:%M:%S}  Job {job['id']} {job['state'].upper()}: {job['title']}"
+    ACTIVITY.append(line)
+    log.info("%s | %s", line, job["result"])
+    if SCREEN:
+        SCREEN.refresh()
+    else:
+        print("  " + line, flush=True)
+
+
+def job_worker() -> None:
+    while True:
+        run_job(JOBS[_APPROVED.get()])
+
+
+def release_caches() -> None:
+    """Forget everything read from the disks (before unmounting, and after a change)."""
+    _HIVES.clear()
+    _EVTX_CACHE.clear()
+    folder_names.cache_clear()
+
+
+def ntfs_hint(error: str) -> str:
+    low = error.lower()
+    if "hibernat" in low:
+        return ("Windows is hibernated (Fast Startup or hibernate), so writing would damage it. "
+                "Use request_clear_hibernation first.")
+    if "unclean" in low or "metadata kept in windows cache" in low:
+        return ("Windows was not shut down cleanly, so writing could damage it. If Fast Startup is on, "
+                "request_clear_hibernation fixes this; otherwise chkdsk must run from Windows Recovery.")
+    return "Could not open the partition for writing: " + error.strip()
+
+
+@contextlib.contextmanager
+def writable(part: dict, extra_options: str = ""):
+    """Remount one partition read-write for a single approved change, then always back to read-only."""
+    if not part.get("device"):  # --test-root folders are plain folders
+        yield Path(part["mountpoint"])
+        release_caches()
+        return
+    dev, name = part["device"], part["name"]
+    WARMED.wait(120)  # don't unmount while the event log is still being indexed
+    release_caches()
+    if part.get("mountpoint") and run(["umount", part["mountpoint"]]).returncode != 0:
+        raise UserError("The partition is in use (maybe a shell on screen 2 is inside it). Close it and try again.")
+    part["mountpoint"] = None
+    target = MOUNT_BASE / name
+    try:
+        run(["blockdev", "--setrw", dev])
+        target.mkdir(parents=True, exist_ok=True)
+        if part["kind"] == "efi":
+            cmd = ["mount", "-t", "vfat", "-o", "rw", dev, str(target)]
+        else:
+            options = "rw,windows_names" + (f",{extra_options}" if extra_options else "")
+            cmd = ["mount", "-t", "ntfs-3g", "-o", options, dev, str(target)]
+        p = run(cmd)
+        if p.returncode != 0:
+            raise UserError(ntfs_hint(p.stderr or p.stdout))
+        try:
+            yield target
+        finally:
+            run(["sync"])
+            if run(["umount", str(target)]).returncode != 0:
+                run(["umount", "-l", str(target)])
+    finally:
+        part["mountpoint"], part["note"] = mount_readonly(dev, name, part["kind"])
+        release_caches()
+
+
+def check_can_change(part: dict) -> None:
+    if part.get("disk_failed"):
+        raise UserError("This disk reports failing health (SMART). Changes are blocked: copy important files first.")
+    if part["kind"] not in ("ntfs", "efi"):
+        raise UserError(f"{part['name']} can't be changed.")
+
+
+def check_write_path(rel: str) -> None:
+    low = rel.replace("\\", "/").lstrip("/").lower()
+    if any(re.search(p, low) for p in DENY_PATTERNS):
+        raise UserError("That file can't be changed here (registry hives, passwords, keys or memory files). "
+                        "Use the registry tools for registry changes.")
+    if low.startswith("users/") and low.count("/") >= 2 and not ALLOW_PERSONAL:
+        raise UserError("Personal files are off-limits unless the owner allowed them.")
+    if low.startswith("rescueai/"):
+        raise UserError("The RescueAI folder holds undo data; use request_undo instead.")
+
+
+def rel_to(root, path) -> str:
+    return os.path.relpath(path, root)
+
+
+def undo_folder(root: Path, job: dict) -> Path:
+    folder = root / "RescueAI" / "undo" / f"{dt.datetime.now():%Y%m%d-%H%M%S}-job{job['id']}"
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def record_undo(job: dict, root: Path, folder: Path | None, records: list[dict]) -> None:
+    """Keep undo data on the job, plus undo.json on the partition as a record of what changed."""
+    job["_undo"] = records
+    folder = folder or undo_folder(root, job)
+    (folder / "undo.json").write_text(json.dumps({"job": job_view(job), "undo": records}, indent=1, default=str))
+
+
+def hive_file(hive: str) -> tuple[str, str]:
+    """(path of a writable hive relative to the Windows partition, normalised hive name)."""
+    upper = hive.strip().upper()
+    if upper in WRITABLE_HIVES:
+        return f"Windows/System32/config/{upper}", upper
+    if upper.startswith("NTUSER:"):
+        user = hive.strip().split(":", 1)[1]
+        return f"Users/{user}/NTUSER.DAT", f"NTUSER:{user}"
+    raise UserError("Changes are allowed in the SYSTEM, SOFTWARE, DEFAULT and NTUSER:<username> hives only.")
+
+
+def normalize_key(hive_name: str, key: str, top) -> str:
+    key_path = re.sub(r"^(HKLM|HKEY_LOCAL_MACHINE|HKCU|HKEY_CURRENT_USER)[\\/]+", "", key.strip(), flags=re.I)
+    key_path = re.sub(rf"^{re.escape(hive_name.split(':')[0])}[\\/]+", "", key_path, flags=re.I)
+    if hive_name == "SYSTEM":
+        key_path = re.sub(r"(?i)^CurrentControlSet", control_set(top), key_path)
+    return key_path.replace("/", "\\").strip("\\")
+
+
+def encode_reg(type_name: str, data: str) -> tuple[int, bytes]:
+    t = REG_TYPES.get(type_name.upper())
+    if t is None:
+        raise UserError(f"value_type must be one of {', '.join(REG_TYPES)}")
+    try:
+        if t in (1, 2):
+            return t, (data + "\0").encode("utf-16-le")
+        if t == 4:
+            return t, struct.pack("<I", int(data, 0) & 0xFFFFFFFF)
+        if t == 11:
+            return t, struct.pack("<Q", int(data, 0) & 0xFFFFFFFFFFFFFFFF)
+        if t == 7:
+            return t, ("\0".join(data.splitlines()) + "\0\0").encode("utf-16-le")
+        return t, bytes.fromhex(data.replace(" ", ""))
+    except ValueError as e:
+        raise UserError(f"data doesn't fit {type_name}: {e}")
+
+
+def show_reg(t: int, raw: bytes) -> str:
+    try:
+        if t in (1, 2):
+            return repr(raw.decode("utf-16-le").rstrip("\0"))
+        if t == 4:
+            return str(struct.unpack_from("<I", raw)[0])
+        if t == 11:
+            return str(struct.unpack_from("<Q", raw)[0])
+        if t == 7:
+            return repr([s for s in raw.decode("utf-16-le").split("\0") if s])
+    except (UnicodeDecodeError, struct.error):
+        pass
+    return raw[:64].hex(" ")
+
+
+def hive_dirty(path: Path) -> bool:
+    """True if the hive still has changes waiting in its .LOG files (editing it would lose them)."""
+    with open(path, "rb") as f:
+        header = f.read(12)
+    primary, secondary = struct.unpack_from("<II", header, 4)
+    return header[:4] == b"regf" and primary != secondary
+
+
+def hivex_apply(path: Path, changes: list[tuple]) -> list[tuple | None]:
+    """Apply (key_path, value_name, type, data) changes to a hive file; data None deletes the value.
+
+    Returns each value's old (type, data), or None where it didn't exist. Nothing is written
+    unless every change succeeds."""
+    try:
+        import hivex
+    except ImportError:
+        raise UserError("Registry editing needs the hivex library (python3-hivex), which isn't installed.")
+    if hive_dirty(path):
+        raise UserError("This registry hive has unsaved changes in its log files (Windows didn't shut down "
+                        "cleanly). Editing it now could lose them; Windows or Windows Recovery must open it first.")
+    h = hivex.Hivex(str(path), write=True)
+    olds = []
+    for key_path, name, rtype, data in changes:
+        node = h.root()
+        for part in (p for p in re.split(r"[\\/]+", key_path) if p):
+            node = next((c for c in h.node_children(node) if h.node_name(c).lower() == part.lower()), None)
+            if node is None:
+                raise UserError(f"Registry key not found: {key_path}")
+        old, keep = None, []
+        for v in h.node_values(node):
+            t, raw = h.value_value(v)
+            if h.value_key(v).lower() == name.lower():
+                old = (t, raw)
+            else:
+                keep.append({"key": h.value_key(v), "t": t, "value": raw})
+        if data is not None:
+            keep.append({"key": name, "t": rtype, "value": data})
+        h.node_set_values(node, keep)
+        olds.append(old)
+    h.commit(None)
+    return olds
+
+
+def registry_undo(part: dict, rel: str, names: list[tuple[str, str]], olds: list) -> dict:
+    values = [{"key": key, "name": name, "old_type": old[0] if old else None, "old_hex": old[1].hex() if old else ""}
+              for (key, name), old in zip(names, olds)]
+    return {"type": "registry", "part": part["name"], "hive": rel, "values": values}
+
+
+def apply_undo(record: dict) -> None:
+    if record["type"] == "boot_order":
+        p = run(["efibootmgr", "-o", ",".join(record["order"])])
+        if p.returncode != 0:
+            raise UserError("efibootmgr failed: " + p.stderr.strip())
+        return
+    with writable(PARTS[record["part"]]) as root:
+        if record["type"] == "registry":
+            hivex_apply(ci_path(root, record["hive"]), [
+                (v["key"], v["name"], v["old_type"], bytes.fromhex(v["old_hex"]) if v["old_type"] is not None else None)
+                for v in record["values"]])
+        elif record["type"] == "rename":
+            os.rename(ci_path(root, record["from"]), root / record["to"])
+        elif record["type"] == "copy":
+            target = ci_path(root, record["target"])
+            if record["backup"]:
+                shutil.copy2(ci_path(root, record["backup"]), root / record["target"])
+            elif target:
+                os.remove(target)
+
+
+def uefi_boot_menu() -> tuple[list[str], dict[str, str]]:
+    """(BootOrder, {entry number: label}) from efibootmgr."""
+    if not shutil.which("efibootmgr") or not Path("/sys/firmware/efi").exists():
+        raise UserError("This PC isn't booted in UEFI mode, or efibootmgr is missing.")
+    p = run(["efibootmgr"])
+    if p.returncode != 0:
+        raise UserError("Can't read the UEFI boot menu: " + p.stderr.strip())
+    order = re.search(r"^BootOrder:\s*(\S+)", p.stdout, re.M)
+    entries = {n.upper(): re.split(r"\t|\s{2,}", rest)[0].strip()
+               for n, rest in re.findall(r"^Boot([0-9A-Fa-f]{4})\*?\s+(.*)$", p.stdout, re.M)}
+    return (order.group(1).upper().split(",") if order else []), entries
+
+
+@tool(change=True)
+def request_set_registry_value(hive: str, key: str, value_name: str, value_type: str, data: str,
+                               reason: str, partition: str = "") -> dict:
+    """Ask to set one value in the offline Windows registry (the person approves it on the PC's screen).
+
+    hive: SYSTEM, SOFTWARE, DEFAULT or NTUSER:<username>.
+    key: e.g. "CurrentControlSet\\Control\\Session Manager\\Power" (HKLM\\ prefixes are fine).
+    value_type: REG_SZ, REG_EXPAND_SZ, REG_DWORD, REG_QWORD, REG_MULTI_SZ (one item per line) or REG_BINARY (hex).
+    data: the new value as text, e.g. "0" for a DWORD. The old value is kept for request_undo."""
+    part = get_part(partition)
+    check_can_change(part)
+    rel, hive_name = hive_file(hive)
+    path = ci_path(Path(part["mountpoint"]), rel)
+    if path is None:
+        raise UserError(f"Hive {hive} was not found on this PC.")
+    top = hive_root(open_hive(path))
+    key_path = normalize_key(hive_name, key, top)
+    current = reg_values(subkey(top, key_path))  # also checks that the key exists
+    name = "" if value_name in ("", "(default)") else value_name
+    old = next((v for k, v in current.items() if k.lower() == (name or "(default)").lower()), None)
+    rtype, raw = encode_reg(value_type, data)
+
+    def run_fn(job):
+        with writable(part) as root:
+            olds = hivex_apply(ci_path(root, rel), [(key_path, name, rtype, raw)])
+            record_undo(job, root, None, [registry_undo(part, rel, [(key_path, name)], olds)])
+        return {"changed": f"{hive_name}\\{key_path}\\{name or '(default)'}", "new": show_reg(rtype, raw),
+                "old": show_reg(*olds[0]) if olds[0] else "(did not exist)"}
+
+    shown_old = fmt_value(old) if old is not None else "(does not exist)"
+    return new_job("registry", f"Set registry value {name or '(default)'}",
+                   [f"Key:   {hive_name}\\{key_path}", f"Value: {name or '(default)'} ({value_type.upper()})",
+                    f"Now:   {shown_old}", f"New:   {show_reg(rtype, raw)}"],
+                   "medium", reason, run_fn)
+
+
+@tool(change=True)
+def request_disable_driver(name: str, reason: str, partition: str = "") -> dict:
+    """Ask to stop a driver or service from loading when Windows starts (Start=4 in every control set).
+    Use it for a bad third-party driver that crashes Windows or blocks start-up. Reversible."""
+    part = get_part(partition)
+    check_can_change(part)
+    rel = "Windows/System32/config/SYSTEM"
+    top = hive_root(open_hive(ci_path(Path(part["mountpoint"]), rel)))
+    found = []
+    for cs in (k.name for k in top.iter_subkeys() if re.fullmatch(r"(?i)ControlSet\d{3}", k.name)):
+        try:
+            svc = subkey(top, f"{cs}/Services/{name}")
+        except UserError:
+            continue
+        found.append((f"{cs}\\Services\\{svc.name}", reg_values(svc)))
+    if not found:
+        raise UserError(f"No driver or service named {name!r} in the SYSTEM hive.")
+    values = found[0][1]
+    starts = {0: "boot", 1: "system", 2: "automatic", 3: "manual", 4: "disabled"}
+    control_sets = ", ".join(k.split("\\")[0] for k, _ in found)
+    details = [f"Driver/service: {name}", f"File: {values.get('ImagePath', '(default location)')}",
+               f"Now starts: {starts.get(values.get('Start'), values.get('Start'))}", "New: disabled (Start=4)",
+               f"In: {control_sets}"]
+    risk = "medium"
+    if name.lower() in CRITICAL_DRIVERS:
+        risk = "high"
+        details.append("WARNING: Windows needs this driver to start. Disabling it will probably stop Windows booting.")
+    keys = [k for k, _ in found]
+
+    def run_fn(job):
+        with writable(part) as root:
+            olds = hivex_apply(ci_path(root, rel), [(k, "Start", 4, struct.pack("<I", 4)) for k in keys])
+            record_undo(job, root, None, [registry_undo(part, rel, [(k, "Start") for k in keys], olds)])
+        return {"disabled": name, "control_sets": len(keys)}
+
+    return new_job("disable_driver", f"Disable driver/service {name}", details, risk, reason, run_fn)
+
+
+@tool(change=True)
+def request_rename_file(path: str, new_name: str, reason: str, partition: str = "") -> dict:
+    """Ask to rename a file or folder on a Windows or EFI partition (nothing is deleted).
+    Typical use: rename a corrupt driver so a good copy can be put in its place. Reversible."""
+    part, target = resolve(path, partition)
+    check_can_change(part)
+    rel = rel_to(part["mountpoint"], target)
+    check_write_path(rel)
+    if not new_name or re.search(r'[\\/:*?"<>|]', new_name):
+        raise UserError("new_name must be a plain name, without folders.")
+    if ci_path(target.parent, new_name) is not None:
+        raise UserError(f"{new_name} already exists in that folder.")
+    check_write_path(str(Path(rel).parent / new_name))
+
+    def run_fn(job):
+        with writable(part) as root:
+            src = ci_path(root, rel)
+            if src is None:
+                raise UserError("The file is no longer there.")
+            dst = src.parent / new_name
+            os.rename(src, dst)
+            record_undo(job, root, None, [{"type": "rename", "part": part["name"],
+                                           "from": rel_to(root, dst), "to": rel_to(root, src)}])
+        return {"renamed": rel, "to": new_name}
+
+    return new_job("rename", f"Rename {Path(rel).name} to {new_name}",
+                   [f"Partition: {part['name']}", f"File: {rel}", f"New name: {new_name}"], "medium", reason, run_fn)
+
+
+@tool(change=True)
+def request_copy_file(source_path: str, target_path: str, reason: str, source_partition: str = "",
+                      target_partition: str = "") -> dict:
+    """Ask to copy one file onto a Windows or EFI partition, e.g. restore a damaged driver from
+    Windows\\System32\\DriverStore\\FileRepository, or put back a missing EFI boot file from
+    Windows\\Boot\\EFI. An existing target file is backed up first. Reversible."""
+    src_part, src = resolve(source_path, source_partition)
+    if src.is_dir():
+        raise UserError("Only single files can be copied.")
+    check_readable(src_part, src)
+    dst_part = get_part(target_partition)
+    check_can_change(dst_part)
+    dst_rel = re.sub(r"^[A-Za-z]:", "", target_path.strip()).replace("\\", "/").strip("/")
+    check_write_path(dst_rel)
+    parent = ci_path(Path(dst_part["mountpoint"]), str(Path(dst_rel).parent))
+    if parent is None or not parent.is_dir():
+        raise UserError("The target folder does not exist.")
+    exists = ci_path(Path(dst_part["mountpoint"]), dst_rel) is not None
+    src_rel = rel_to(src_part["mountpoint"], src)
+    size = src.stat().st_size
+
+    def run_fn(job):
+        with writable(dst_part) as root:
+            # re-find the source: its partition may be the one that was just remounted
+            source = ci_path(root if src_part is dst_part else Path(src_part["mountpoint"]), src_rel)
+            target = ci_path(root, dst_rel) or ci_path(root, str(Path(dst_rel).parent)) / Path(dst_rel).name
+            folder = undo_folder(root, job)
+            backup = None
+            if target.exists():
+                saved = folder / "original" / target.name
+                saved.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(target, saved)
+                backup = rel_to(root, saved)
+            shutil.copy2(source, target)
+            record_undo(job, root, folder, [{"type": "copy", "part": dst_part["name"],
+                                             "target": rel_to(root, target), "backup": backup}])
+        return {"copied": src_rel, "to": dst_rel, "bytes": size, "replaced_existing_file": backup is not None}
+
+    details = [f"From: {src_part['name']}: {src_rel} ({size:,} bytes)", f"To:   {dst_part['name']}: {dst_rel}",
+               "The existing file is backed up first." if exists else "This creates a new file."]
+    return new_job("copy", f"Copy {Path(src_rel).name} to {dst_part['name']}", details, "medium", reason, run_fn)
+
+
+@tool(change=True)
+def request_clear_hibernation(reason: str, disable_fast_startup: bool = True, partition: str = "") -> dict:
+    """Ask to remove Windows' hibernation file so the partition can be changed safely, and by default
+    turn off Fast Startup so it doesn't come back. NOT reversible: anything left open in Windows apps
+    when it was hibernated is lost (a normal Fast Startup shutdown loses nothing)."""
+    part = get_part(partition)
+    check_can_change(part)
+    root = Path(part["mountpoint"])
+    cs = control_set(hive_root(open_hive(ci_path(root, "Windows/System32/config/SYSTEM"))))
+    power_key = f"{cs}\\Control\\Session Manager\\Power"
+
+    def run_fn(job):
+        result = {}
+        with writable(part, "remove_hiberfile") as root_w:
+            result["hibernation_file_present"] = ci_path(root_w, "hiberfil.sys") is not None
+            if disable_fast_startup:
+                try:
+                    hivex_apply(ci_path(root_w, "Windows/System32/config/SYSTEM"),
+                                [(power_key, "HiberbootEnabled", 4, struct.pack("<I", 0))])
+                    result["fast_startup_disabled"] = True
+                except UserError as e:
+                    result["fast_startup_disabled"], result["note"] = False, str(e)
+        return result
+
+    details = [f"Partition: {part['name']}", f"Hibernated now: {'yes' if hibernated(root) else 'no'}",
+               "Removes hiberfil.sys: Windows starts fresh instead of resuming.",
+               "Turns off Fast Startup (HiberbootEnabled=0)." if disable_fast_startup else "Leaves Fast Startup as it is.",
+               "Anything left open in Windows apps when it hibernated is lost."]
+    return new_job("clear_hibernation", "Clear Windows hibernation", details, "medium", reason, run_fn,
+                   reversible=False)
+
+
+@tool(change=True)
+def request_boot_order(first_entry: str, reason: str) -> dict:
+    """Ask to move one entry to the front of the PC's UEFI boot menu. first_entry is its number
+    (e.g. "0001") or part of its name (e.g. "Windows Boot Manager"). Reversible."""
+    order, entries = uefi_boot_menu()
+    wanted = first_entry.strip().upper().removeprefix("BOOT")
+    matches = [n for n in entries if n == wanted] or [n for n, label in entries.items()
+                                                      if first_entry.strip().lower() in label.lower()]
+    if len(matches) != 1:
+        raise UserError(f"{len(matches)} entries match. Entries: " + "; ".join(f"{n} {l}" for n, l in entries.items()))
+    first = matches[0]
+    new_order = [first] + [n for n in order if n != first]
+
+    def run_fn(job):
+        p = run(["efibootmgr", "-o", ",".join(new_order)])
+        if p.returncode != 0:
+            raise UserError("efibootmgr failed: " + p.stderr.strip())
+        job["_undo"] = [{"type": "boot_order", "order": order}]
+        return {"boot_order": new_order}
+
+    def names(o):
+        return ", ".join(f"{n} {entries.get(n, '?')}" for n in o)
+
+    return new_job("boot_order", f"Boot '{entries[first]}' first",
+                   [f"Now: {names(order)}", f"New: {names(new_order)}"], "low", reason, run_fn)
+
+
+@tool(change=True)
+def request_run_command(command: str, reason: str, writable_partitions: list[str] | None = None) -> dict:
+    """EXPERT MODE ONLY: ask to run one bash command as root on the rescue system. Partitions are
+    mounted at /mnt/rescue/<name>; those listed in writable_partitions are read-write while the
+    command runs, all others stay read-only. The person sees the exact command before approving.
+    Times out after 10 minutes. Not reversible."""
+    if not EXPERT:
+        raise UserError("Expert mode is off. Ask the person to press E on the PC's screen if they want to allow commands.")
+    parts = [get_part(n) for n in writable_partitions or []]
+    for p in parts:
+        check_can_change(p)
+
+    def run_fn(job):
+        if not EXPERT:
+            raise UserError("Expert mode was turned off before the command ran.")
+        with contextlib.ExitStack() as stack:
+            for p in parts:
+                stack.enter_context(writable(p))
+            try:
+                done = subprocess.run(["bash", "-c", command], capture_output=True, text=True, errors="replace",
+                                      timeout=600)
+            except subprocess.TimeoutExpired:
+                raise UserError("The command timed out after 10 minutes.")
+        out = done.stdout + (f"\n[stderr]\n{done.stderr}" if done.stderr.strip() else "")
+        return {"exit_code": done.returncode, "output": clip(out, 30_000, tail=True)}
+
+    details = [f"Command: {command}",
+               "Writable while it runs: " + (", ".join(p["name"] for p in parts) or "nothing (all read-only)")]
+    return new_job("command", "Run a command (expert mode)", details, "high", reason, run_fn, reversible=False)
+
+
+@tool(change=True)
+def request_undo(job_id: int, reason: str) -> dict:
+    """Ask to revert a completed change from this session (registry values, disabled drivers,
+    renamed or copied files, boot order). Needs approval like any change."""
+    job = JOBS.get(job_id)
+    if not job or job["state"] != "done" or not job.get("_undo"):
+        raise UserError("Only completed, reversible changes from this session can be undone.")
+    if job.get("undone_by"):
+        raise UserError(f"Job {job_id} was already undone by job {job['undone_by']}.")
+    records = job["_undo"]
+
+    def run_fn(undo_job):
+        for record in records:
+            apply_undo(record)
+        job["undone_by"] = undo_job["id"]
+        return {"undone": job_id}
+
+    return new_job("undo", f"Undo job {job_id}: {job['title']}", [f"Reverts: {job['title']}"] + job["details"],
+                   "low", reason, run_fn, reversible=False)
+
+
+@tool(locked=False)
+def get_job_status(job_id: int) -> dict:
+    """State of a change you requested: waiting_for_approval, approved, running, done, failed,
+    rejected or expired, with its result."""
+    pending_jobs()  # marks expired ones
+    job = JOBS.get(job_id)
+    if not job:
+        raise UserError(f"No job {job_id} in this session.")
+    return job_view(job)
+
+
+@tool(locked=False)
+def list_jobs() -> dict:
+    """All changes requested in this session and their states."""
+    pending_jobs()
+    return {"expert_mode": EXPERT, "jobs": [job_view(j) for j in JOBS.values()]}
+
+
 # ---------------------------------------------------------------- server
 
 
@@ -1320,12 +1959,13 @@ def print_qr(text: str) -> None:
 
 def announce(url: str) -> None:
     bar = "=" * 74
-    print(f"\n{bar}\n  Rescue AI is ready (read-only). Give this link to Claude:\n\n    {url}\n", flush=True)
+    print(f"\n{bar}\n  Rescue AI is ready. Give this link to Claude:\n\n    {url}\n", flush=True)
     print_qr(url)
     print("  claude.ai / Claude Desktop: Settings > Connectors > Add custom connector\n"
           f"  Claude Code: claude mcp add --transport http rescue {url}\n\n"
           "  Copy in this terminal with Ctrl+Shift+C. The link is also saved in /tmp/rescue-ai-link.txt\n"
-          "  Anyone with this link can READ this PC's disk. Press Ctrl+C here to stop.\n"
+          "  Anyone with this link can READ this PC's disk. Changes happen only when you press Y here.\n"
+          "  Keys: Y/N approve or reject a change, L new link, S stop sharing, E expert mode. Ctrl+C stops.\n"
           f"{bar}\n", flush=True)
     try:
         Path("/tmp/rescue-ai-link.txt").write_text(url + "\n")
@@ -1401,7 +2041,7 @@ class Tunnel:
 
     def stop(self) -> None:
         self.close()
-        self._set("Sharing stopped. Press N for a new link.")
+        self._set("Sharing stopped. Press L for a new link.")
 
     def close(self) -> None:
         self.generation += 1
@@ -1423,17 +2063,19 @@ def found_lines() -> list[str]:
 
 
 class Screen:
-    """Full-screen status display on the PC's own monitor (Rescue USB, tty1), with keys N/S/P."""
+    """Full-screen status display on the PC's own monitor (Rescue USB, tty1).
+
+    A waiting change request takes over the top of the screen until Y or N is pressed."""
 
     def __init__(self, link):
         self.link = link
         self.dirty = threading.Event()
         self.qr_for, self.qr = None, []
+        self.belled: set[int] = set()
 
     def start(self) -> None:
         sys.stdout.write("\033[?25l")  # hide the cursor
         threading.Thread(target=self._draw_loop, daemon=True).start()
-        threading.Thread(target=self._key_loop, daemon=True).start()
         self.refresh()
 
     def refresh(self) -> None:
@@ -1453,8 +2095,28 @@ class Screen:
         url = self.link.url
         if url != self.qr_for:
             self.qr_for, self.qr = url, qr_lines(url) if url else []
-        lines = [" RESCUE AI - read-only PC check ".center(cols, "="), "", f" Status: {self.link.status}", ""]
-        if url:
+
+        def wrapped(text: str, indent: int) -> list[str]:
+            return textwrap.wrap(text, cols - indent, initial_indent=" " * indent, subsequent_indent=" " * indent) or [""]
+
+        mode = "EXPERT MODE" if EXPERT else "PC check"
+        lines = [f" RESCUE AI - {mode} ".center(cols, "="), "", f" Status: {self.link.status}", ""]
+        waiting = pending_jobs()
+        bell = ""
+        if waiting:
+            job = waiting[0]
+            if job["id"] not in self.belled:
+                self.belled.add(job["id"])
+                bell = "\a"
+            more = f"   (+{len(waiting) - 1} more waiting)" if len(waiting) > 1 else ""
+            lines += ["!" * cols, f" CLAUDE ASKS TO CHANGE THIS PC  -  risk: {job['risk'].upper()}{more}", ""]
+            lines += wrapped(job["title"], 3)
+            for d in job["details"]:
+                lines += wrapped(d, 5)
+            lines += wrapped(f"Reason given by the AI: {job['ai_reason']}", 3)
+            lines += ["   " + ("Can be undone later." if job["reversible"] else "This cannot be undone."), "",
+                      "   Press Y to approve or N to reject.", "!" * cols, ""]
+        elif url:
             lines.append(" Add this link to Claude (Settings > Connectors > Add custom connector):")
             lines += ["   " + url[i:i + cols - 4] for i in range(0, len(url), cols - 4)]
             lines.append("")
@@ -1465,33 +2127,58 @@ class Screen:
         if free > 1:
             lines += [" What Claude is doing:"] + ["   " + a for a in list(ACTIVITY)[-(free - 1):]]
         lines = lines[: rows - 1] + [""] * (rows - 1 - len(lines))
-        footer = " [N] new link   [S] stop sharing   [P] power off"
-        sys.stdout.write("\033[H\033[J" + "\n".join(l[:cols] for l in lines) + "\n" + footer[:cols])
+        if waiting:
+            footer = " [Y] approve   [N] reject"
+        else:
+            footer = " [L] new link   [S] stop sharing   [E] expert mode   [P] power off"
+        sys.stdout.write(bell + "\033[H\033[J" + "\n".join(l[:cols] for l in lines) + "\n" + footer[:cols])
         sys.stdout.flush()
 
-    def _key_loop(self) -> None:
-        try:
-            import termios  # noqa: F401  (Linux only)
-            import tty
 
-            fd = sys.stdin.fileno()
-            tty.setcbreak(fd)
-        except Exception:
-            return  # no keyboard attached to this process
-        while True:
-            data = os.read(fd, 1)
-            if not data:
-                return
-            key = data.decode(errors="ignore").lower()
-            if key == "n":
-                self.link.new_link()
-            elif key == "s":
-                self.link.stop()
-            elif key == "p":
-                self.link.close()
-                unmount_ours()
-                subprocess.Popen(["systemctl", "poweroff"])
-            self.refresh()
+_TTY_STATE = None  # (fd, settings) to restore when the agent exits
+
+
+def key_loop(link) -> None:
+    """Keys on the PC: Y/N decide the waiting change; L, S, E and P manage the link, expert mode and power."""
+    global EXPERT, _TTY_STATE
+    try:
+        import termios
+        import tty
+
+        fd = sys.stdin.fileno()
+        _TTY_STATE = (fd, termios.tcgetattr(fd))
+        tty.setcbreak(fd)
+    except Exception:
+        return  # no keyboard attached to this process
+    while True:
+        data = os.read(fd, 1)
+        if not data:
+            return
+        key = data.decode(errors="ignore").lower()
+        if key in ("y", "n"):
+            decide(key == "y")
+        elif key == "l":
+            link.new_link()
+        elif key == "s":
+            link.stop()
+        elif key == "e":
+            EXPERT = not EXPERT
+            word = "ON: Claude may ask to run commands (each one still needs Y)" if EXPERT else "OFF"
+            ACTIVITY.append(f"{dt.datetime.now():%H:%M:%S}  Expert mode {word}")
+            log.info("Expert mode %s", word)
+        elif key == "p" and SCREEN:
+            link.close()
+            unmount_ours()
+            subprocess.Popen(["systemctl", "poweroff"])
+        if SCREEN:
+            SCREEN.refresh()
+
+
+def restore_tty() -> None:
+    if _TTY_STATE:
+        import termios
+
+        termios.tcsetattr(_TTY_STATE[0], termios.TCSADRAIN, _TTY_STATE[1])
 
 
 def link_changed(link) -> None:
@@ -1515,11 +2202,12 @@ def warm_up() -> None:
                     log.info("Indexed the System event log on %s (%d events).", p["name"], n)
                 except Exception as e:
                     log.warning("Could not read the System event log on %s: %s", p["name"], e)
+    WARMED.set()
 
 
 def main() -> None:
     global ALLOW_PERSONAL, SCREEN
-    ap = argparse.ArgumentParser(description="Rescue AI: read-only MCP server for examining a Windows PC.")
+    ap = argparse.ArgumentParser(description="Rescue AI: MCP server for examining and repairing a Windows PC.")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--host", default="127.0.0.1",
                     help="use 0.0.0.0 together with --no-tunnel to serve a private network such as Tailscale")
@@ -1529,7 +2217,7 @@ def main() -> None:
     ap.add_argument("--test-root", action="append", default=[], metavar="DIR",
                     help="treat DIR as a Windows partition instead of mounting disks (for testing)")
     ap.add_argument("--console", action="store_true",
-                    help="full-screen display with keys N/S/P on the PC's monitor (used by the Rescue USB)")
+                    help="full-screen display on the PC's monitor (used by the Rescue USB)")
     args = ap.parse_args()
     ALLOW_PERSONAL = args.allow_personal_files
 
@@ -1553,9 +2241,10 @@ def main() -> None:
         discover()
 
     if not args.console:
-        print("\nRescue AI - read-only mode. Found:")
+        print("\nRescue AI - Windows is read-only until you approve a change. Found:")
         print("\n".join("  " + line for line in found_lines()))
     threading.Thread(target=warm_up, daemon=True).start()
+    threading.Thread(target=job_worker, daemon=True).start()
 
     gate = TokenGate(mcp.streamable_http_app(), secrets.token_urlsafe(24))
     if args.no_tunnel:
@@ -1571,12 +2260,14 @@ def main() -> None:
     elif not args.no_tunnel:
         print("\nOpening the secure link (takes about 10 seconds)...", flush=True)
     link.start()
+    threading.Thread(target=key_loop, args=(link,), daemon=True).start()
 
     try:
         uvicorn.run(gate, host=args.host, port=args.port, log_level="warning")
     finally:
         link.close()
         unmount_ours()
+        restore_tty()
         log.info("Stopped. The link no longer works. Activity log: %s", log_path)
 
 
