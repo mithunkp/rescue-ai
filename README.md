@@ -4,7 +4,9 @@ Boot a broken Windows PC from a USB stick and let Claude (or any MCP client) dia
 
 - Claude inspects disks, crash records, event logs, the registry, boot configuration, updates and drivers.
 - It can **ask** to make fixes: registry values, drivers, files, hibernation, boot order, and commands in expert mode.
-- Each fix shows on the PC's screen and only runs when the person there presses **Y**. Most fixes can be undone.
+- It can run **Windows' own repair tools** (chkdsk, sfc, DISM, bcdboot) in a small virtual machine.
+- It can **back up files** or a whole disk image to a USB drive.
+- Each action shows on the PC's screen and only runs when the person there presses **Y**. Most fixes can be undone.
 
 | Folder | What it is |
 |---|---|

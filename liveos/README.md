@@ -41,6 +41,9 @@ Use Rufus: select the USB stick and `rescue-ai-amd64.iso`, click **Start**, and 
 - The agent from `../agent`, with its Python packages pre-installed in `/opt/rescue-ai/.venv`
 - `cloudflared` for the link
 - Disk, boot and hardware tools: smartmontools, nvme-cli, ntfs-3g, cryptsetup, efibootmgr, mokutil, lshw and others
+- Backups and repairs:
+  - GNU ddrescue, for disk images
+  - QEMU, OVMF, wimlib and mtools, for starting Windows' own recovery environment in a small virtual machine
 
 Files:
 

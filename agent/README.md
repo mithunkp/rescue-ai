@@ -114,7 +114,27 @@ The activity log is in `/var/log/rescue-ai.log`. Ubuntu "Try" mode forgets every
 | `request_clear_hibernation` | Removes the hibernation file and turns off Fast Startup | ❌ |
 | `request_boot_order` | Puts an entry first in the UEFI boot menu | ✅ |
 | `request_run_command` | Runs a command (expert mode only) | ❌ |
-| `request_undo`, `get_job_status`, `list_jobs` | Undo a change; check what happened | |
+| `request_windows_repair` | Runs Windows' own chkdsk, sfc, DISM (revert stuck update, repair, remove an update or driver) or bcdboot (see below) | ❌ |
+| `request_undo`, `get_job_status`, `list_jobs`, `cancel_job` | Undo a change; check, list or cancel jobs | |
+
+**Backups (each one needs Y; they only read the Windows disk, so they're allowed even when it's failing):**
+
+| Tool | What it does |
+|---|---|
+| `list_backup_drives` | USB drives that can take a backup, with free space. The rescue stick itself is never listed |
+| `request_backup` | Copies folders, files or `profile:<user>` (Desktop, Documents, Pictures, Videos, Music and Downloads, including folders moved into OneDrive) |
+| `request_disk_image` | Copies a whole partition sector by sector with GNU ddrescue. For failing disks |
+
+How backups work:
+- Each file is read back and checked after copying, with a SHA-256 checksum listed in `manifest.csv`.
+- Files that can't be copied are listed in `problems.csv`. That includes OneDrive files that only exist in the cloud and EFS-encrypted files.
+- Running the same backup again the same day continues where it stopped.
+- Files go to `RescueAI-Backup/<PC name>_<date>/` on the USB drive.
+
+**Windows' own repair tools:** the PC's own Windows recovery environment starts in a small virtual machine with the Windows disk attached. If the PC has none, a plugged-in Windows install USB is used instead. The chosen tool runs, its output comes back to Claude, and the disk returns to read-only. To help choose what to run, Claude has:
+- `check_repair_tools`: can the repair tools run on this PC?
+- `list_installed_updates`: finds stuck updates and the update to remove
+- `list_third_party_drivers`: finds the driver to remove
 
 Changes are refused when:
 - the disk reports failing health
@@ -157,6 +177,10 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt evtx
 
 ## Limits of this version
 
-- Repairs that need Windows' own tools (SFC, DISM, bcdboot, chkdsk) can't run here yet. Claude gives you steps for the Windows Recovery Environment instead (running them automatically is milestone M3 in `../IMPLEMENTATION_PLAN.md`).
+- Windows' repair tools need:
+  - at least 4 GB of RAM
+  - the PC's own recovery image, or a Windows install USB
+  - hardware virtualization (VT-x / AMD-V) turned on in the BIOS for normal speed; without it they work but are very slow
+- So far the repair pipeline has been tested up to the point where Windows' recovery environment starts. The first runs on a real PC are the final test.
 - It can't unlock BitLocker drives yet.
 - You get a new link every run.
