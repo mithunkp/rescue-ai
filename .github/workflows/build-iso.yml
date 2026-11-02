@@ -1,17 +1,28 @@
 name: Build Rescue USB image
 
+# Actions are pinned to exact commits (a tag can be moved; a commit can't). Dependabot updates them.
 on:
   push:
     branches: [main]
     paths: ["agent/**", "liveos/**", ".github/workflows/build-iso.yml"]
+  pull_request:  # every pull request (also from forks: read-only token, no secrets)
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write      # build provenance, only used for main
+      attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
 
       - name: Build the ISO in a Debian 13 container
         run: |
@@ -23,8 +34,16 @@ jobs:
             sh liveos/build.sh
           '
 
+      # Signed record that this ISO was built by this workflow from this commit, so anyone can check
+      # an ISO really came from here: gh attestation verify rescue-ai-amd64.iso --repo mithunkp/rescue-ai
+      - name: Record where the ISO came from
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4
+        with:
+          subject-path: liveos/rescue-ai-amd64.iso
+
       - name: Upload the ISO
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         with:
           name: rescue-ai-iso
           path: |
@@ -42,7 +61,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8
         with:
           name: rescue-ai-iso
 
@@ -89,7 +108,7 @@ jobs:
 
       - name: Upload the screenshots and log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         with:
           name: boot-screens
           path: shots/

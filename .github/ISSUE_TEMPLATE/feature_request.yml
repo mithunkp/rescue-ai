@@ -1,0 +1,35 @@
+name: Idea for a feature
+description: Suggest something new. Ideas are agreed here before anyone writes code.
+labels: [proposal]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem on a broken PC does this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: how
+    attributes:
+      label: How would it work?
+  - type: dropdown
+    id: writes
+    attributes:
+      label: Does it change anything on the Windows disk?
+      options:
+        - No, it only reads
+        - Yes, through an approval card at the PC
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: risk
+    attributes:
+      label: What could go wrong, and how is the person at the PC protected?
+  - type: checkboxes
+    id: rules
+    attributes:
+      label: Safety rules
+      options:
+        - label: I've read the safety rules in CONTRIBUTING.md
+          required: true
