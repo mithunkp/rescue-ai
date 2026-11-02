@@ -111,7 +111,11 @@ The activity log is in `/var/log/rescue-ai.log`. Ubuntu "Try" mode forgets every
 | `request_disable_driver` | Stops a driver or service from loading at start-up | ✅ |
 | `request_rename_file` | Renames a file (nothing is deleted) | ✅ |
 | `request_copy_file` | Copies or restores a file; an existing file is backed up first | ✅ |
+| `request_copy_files` | Copies up to 20 files with **one** approval | ✅ |
 | `request_clear_hibernation` | Removes the hibernation file and turns off Fast Startup | ❌ |
+| `request_reset_ntfs_journal` | Makes a partition writable after an unclean shutdown (ntfsfix). **Type `RESET`** to approve | ❌ |
+| `request_restore_registry_hive` | Puts a damaged registry hive (and its `.LOG` files) back from a restore point. **Type `RESTORE`** to approve | ✅ |
+| `request_restore_from_restore_point` | Brings back up to 20 files from a restore point with one approval | ✅ |
 | `request_boot_order` | Puts an entry first in the UEFI boot menu | ✅ |
 | `request_run_command` | Runs a command (expert mode only) | ❌ |
 | `request_windows_repair` | Runs Windows' own chkdsk, sfc, DISM (revert stuck update, repair, remove an update or driver) or bcdboot (see below) | ❌ |
@@ -136,9 +140,16 @@ How backups work:
 - `list_installed_updates`: finds stuck updates and the update to remove
 - `list_third_party_drivers`: finds the driver to remove
 
-Changes are refused when:
+For the riskiest changes, pressing Y isn't enough: you type the word shown on the card and press Enter. While you type, other keys do nothing, and Esc rejects.
+
+**Restore points and the registry:**
+- `list_restore_points` lists Windows restore points and their dates. You can look inside one, read-only, by using `<partition>@rp<N>` as the partition name.
+- `check_registry` opens every registry file and reports damaged ones, for example a SOFTWARE hive that's missing `CurrentVersion`.
+
+Changes are refused when (the error says which check failed):
 - the disk reports failing health
-- Windows is hibernated or wasn't shut down cleanly (until `request_clear_hibernation`)
+- Windows is **hibernated** (fix: `request_clear_hibernation`)
+- Windows **wasn't shut down cleanly**, so its NTFS journal has unwritten changes. This isn't the same as hibernation. Fix: `request_windows_repair` chkdsk, or `request_reset_ntfs_journal`. `windows_info` shows each partition's `write_safety` up front.
 - a registry hive has unsaved log data
 - the target is a personal file, a password store, or a raw registry hive file
 
