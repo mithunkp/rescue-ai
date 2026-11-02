@@ -1,0 +1,8 @@
+# Every change needs the maintainer's review. The safety-critical areas are listed on their own
+# so it's clear they always get a careful look: the agent (approvals, write paths, the link and
+# the screen), the USB image, and the workflows that build and test it.
+*                        @mithunkp
+/agent/rescue_agent.py   @mithunkp
+/agent/tests/            @mithunkp
+/liveos/                 @mithunkp
+/.github/                @mithunkp

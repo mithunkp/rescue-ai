@@ -7,8 +7,12 @@ python3 -m venv --system-site-packages /opt/rescue-ai/.venv
 /opt/rescue-ai/.venv/bin/pip install --no-cache-dir --disable-pip-version-check \
 	-r /opt/rescue-ai/requirements.txt evtx
 
-# cloudflared opens the secure link
-python3 -c "import urllib.request; urllib.request.urlretrieve('https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb', '/tmp/cloudflared.deb')"
+# cloudflared opens the secure link: one exact version, checked against its published SHA-256
+CLOUDFLARED_VERSION=2026.10.7
+CLOUDFLARED_SHA256=70b1a1e0f46033ffc8d90b406e554044ba6cbf2e4360295ef1163aed31e09393
+python3 -c "import urllib.request, sys; urllib.request.urlretrieve(sys.argv[1], '/tmp/cloudflared.deb')" \
+	"https://github.com/cloudflare/cloudflared/releases/download/$CLOUDFLARED_VERSION/cloudflared-linux-amd64.deb"
+echo "$CLOUDFLARED_SHA256  /tmp/cloudflared.deb" | sha256sum -c -
 dpkg -i /tmp/cloudflared.deb
 rm -f /tmp/cloudflared.deb
 

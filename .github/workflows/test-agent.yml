@@ -2,8 +2,13 @@ name: Test agent on Linux
 
 on:
   push:
+    branches: [main]
     paths: ["agent/**", ".github/workflows/test-agent.yml"]
+  pull_request:  # every pull request (also from forks: read-only token, no secrets)
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -12,7 +17,9 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          persist-credentials: false
 
       - name: Install tools
         run: |
@@ -33,5 +40,5 @@ jobs:
       - name: Backups, disk images and the Windows repair pipeline
         run: sudo .venv/bin/python agent/tests/test_backup_repair_linux.py < <(sleep 3600)
 
-      - name: Fixes from the first real-PC session
+      - name: Fixes from the first real-PC sessions
         run: sudo .venv/bin/python agent/tests/test_feedback_linux.py < <(sleep 3600)

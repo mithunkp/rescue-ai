@@ -1,0 +1,32 @@
+name: Problem report
+description: Something didn't work on a PC
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: >
+        Please don't paste a Rescue AI link, BitLocker keys or personal files.
+        Security problems: use "Report a vulnerability" on the Security tab instead.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what you saw (screen text or Claude's message).
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: ISO or commit
+      description: The ISO's build date, or the commit id
+  - type: input
+    id: pc
+    attributes:
+      label: PC
+      description: Make and model, Windows version, UEFI or legacy BIOS, Secure Boot on or off
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: The end of /var/log/rescue-ai.log (Alt+F2 on the USB), or the error Claude showed
+      render: text
