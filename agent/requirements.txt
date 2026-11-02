@@ -1,4 +1,4 @@
-mcp>=1.13,<2
+mcp>=2.3.0,<3
 uvicorn>=0.30
 anyio>=4
 regipy>=3.1
