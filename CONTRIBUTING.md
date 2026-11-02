@@ -36,6 +36,8 @@ python -m venv .venv
 
 It prints a local MCP link, and the address of the PC's screen page.
 
+**Changing how the screen looks?** Run `python agent/preview_screen.py`. It opens the real screen page in your browser with made-up data and walks through every state (ready, approval, typed confirmation, working, waiting for the network, sharing off). It touches no disk and goes nowhere online. Please include screenshots in your pull request.
+
 The Linux integration tests need root and real loop devices; GitHub Actions runs them for every pull request. To run them yourself on Debian or Ubuntu, see `.github/workflows/test-agent.yml`. Each one runs as `sudo .venv/bin/python agent/tests/<test>.py`.
 
 ## Style
