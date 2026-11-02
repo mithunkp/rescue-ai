@@ -8,6 +8,9 @@ on:
 jobs:
   test:
     runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
 
@@ -15,15 +18,20 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ntfs-3g python3-hivex python3-venv \
-            gddrescue wimtools mtools dosfstools fdisk ovmf
+            gddrescue wimtools mtools dosfstools fdisk ovmf dmsetup
 
       - name: Python environment
         run: |
           python3 -m venv --system-site-packages .venv
           .venv/bin/pip install -q -r agent/requirements.txt evtx
 
+      # Each test gets a stdin that never ends, like the PC's console on the Rescue USB:
+      # a helper program that waits for keyboard input hangs there, and fails the test here.
       - name: Approved changes on a real NTFS disk image
-        run: sudo .venv/bin/python agent/tests/test_changes_linux.py
+        run: sudo .venv/bin/python agent/tests/test_changes_linux.py < <(sleep 3600)
 
       - name: Backups, disk images and the Windows repair pipeline
-        run: sudo .venv/bin/python agent/tests/test_backup_repair_linux.py
+        run: sudo .venv/bin/python agent/tests/test_backup_repair_linux.py < <(sleep 3600)
+
+      - name: Fixes from the first real-PC session
+        run: sudo .venv/bin/python agent/tests/test_feedback_linux.py < <(sleep 3600)

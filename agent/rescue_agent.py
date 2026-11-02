@@ -56,7 +56,7 @@ PARTS: dict[str, dict] = {}  # partition name -> info, filled in at start-up
 ALLOW_PERSONAL = False
 ACTIVITY: collections.deque = collections.deque(maxlen=200)
 SCREEN = None  # the full-screen display, in --console mode
-_LOCK = threading.Lock()  # tools run one at a time (hive/evtx readers aren't thread-safe)
+_LOCK = threading.RLock()  # tools run one at a time (hive/evtx readers aren't thread-safe); re-entrant for jobs
 
 PART_TYPES = {
     EFI_GUID: "EFI system",
@@ -181,6 +181,17 @@ How to work:
    - request_run_command only works after the person turns on Expert mode.
    - If disk health is bad, change nothing. Rescue their files first:
      request_backup or request_disk_image (both only read the failing disk).
+   - Writes are refused when the partition isn't safe to write; the error says
+     which check failed. "hibernated" -> request_clear_hibernation.
+     "not shut down cleanly" (NTFS journal) -> request_windows_repair("chkdsk"),
+     or request_reset_ntfs_journal if chkdsk can't run. windows_info shows the
+     partition's write_safety up front.
+   - Damaged registry: check_registry finds it; list_restore_points and
+     request_restore_registry_hive bring a healthy copy back. Look inside a
+     restore point with partition "<partition>@rpN". Read restore points
+     before changing the partition.
+   - Several files at once: request_copy_files or
+     request_restore_from_restore_point (one approval for the whole set).
 
 Notes:
 - Event-log "days" count back from the newest event in that log, because the
@@ -257,7 +268,10 @@ def tool(fn=None, *, change: bool = False, locked: bool = True):
 
 
 def run(cmd: list[str], timeout: int = 60) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout)
+    # stdin is never the keyboard: on the Rescue USB the agent's stdin is the PC's console, and a
+    # helper that asks a question (mtools does) would otherwise wait there forever.
+    return subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
+                          timeout=timeout)
 
 
 def clip(text: str, limit: int, tail: bool = False) -> str:
@@ -393,6 +407,30 @@ def mount_info(dev: str) -> tuple[str, bool] | None:
     return fs["target"], "ro" in fs["options"].split(",")
 
 
+NTFS_STATES: dict[str, str] = {}  # device -> clean / hibernated / unclean / unknown (...)
+NTFS_STATE_TEXT = {
+    "clean": "clean (safe to change after approval)",
+    "hibernated": "hibernated: hiberfil.sys holds a saved Windows session (hibernate or Fast Startup)",
+    "unclean": "not shut down cleanly: the NTFS journal still has changes Windows hadn't written "
+               "(crash, power loss or forced shutdown). This is not hibernation",
+}
+
+
+def probe_ntfs(dev: str) -> str:
+    """Can the volume be written safely? Asks ntfs-3g itself, the tool that would do the writing."""
+    if not shutil.which("ntfs-3g.probe"):
+        return "unknown (ntfs-3g.probe missing)"
+    p = run(["ntfs-3g.probe", "--readwrite", dev])
+    said = " ".join((p.stderr + p.stdout).split())
+    if p.returncode == 0:
+        return "clean"
+    if p.returncode == 15 or "unclean" in said.lower():  # check before hibernation: its text mentions both
+        return "unclean"
+    if p.returncode == 14 or "is hibernated" in said.lower():
+        return "hibernated"
+    return f"unknown (ntfs-3g.probe exit {p.returncode}: {said[:200]})"
+
+
 def mount_readonly(dev: str, name: str, kind: str) -> tuple[str | None, str]:
     """Mount a partition read-only. Returns (mountpoint, problem note)."""
     found = mount_info(dev)
@@ -406,6 +444,8 @@ def mount_readonly(dev: str, name: str, kind: str) -> tuple[str | None, str]:
 
     target = MOUNT_BASE / name
     target.mkdir(parents=True, exist_ok=True)
+    if kind == "ntfs":
+        NTFS_STATES[dev] = probe_ntfs(dev)  # before mounting: the probe needs the volume free
     run(["blockdev", "--setro", dev])  # block-level protection on top of the ro mount
     attempts = [["-t", "vfat", "-o", "ro"]] if kind == "efi" else [["-t", "ntfs3", "-o", "ro"], ["-t", "ntfs-3g", "-o", "ro"]]
     errors = []
@@ -462,6 +502,7 @@ def add_test_root(path: str) -> None:
 
 
 def unmount_ours() -> None:
+    close_restore_points()
     for p in PARTS.values():
         if p.get("device") and (p.get("mountpoint") or "").startswith(str(MOUNT_BASE)):
             run(["umount", p["mountpoint"]])
@@ -470,6 +511,8 @@ def unmount_ours() -> None:
 def get_part(name: str = "") -> dict:
     if name:
         part = PARTS.get(name.removeprefix("/dev/"))
+        if not part and (m := re.fullmatch(r"(.+)@rp(\d+)", name.removeprefix("/dev/"))):
+            part = open_restore_point(m.group(1), int(m.group(2)))
         if not part:
             raise UserError(f"Unknown partition {name!r}. Known: {', '.join(PARTS) or 'none'}")
     else:
@@ -711,12 +754,14 @@ def dump_header(path: Path) -> dict:
 
 
 def hibernated(root: Path) -> bool | None:
+    """True if hiberfil.sys holds a saved session ("hibr"/"rstr" header); zeros or "wake" mean it doesn't.
+    The Fast Startup setting alone says nothing about the disk's state."""
     f = ci_path(root, "hiberfil.sys")
     if f is None:
         return False
     try:
         with open(f, "rb") as fh:
-            return fh.read(4).lower() == b"hibr"
+            return fh.read(4).lower() in (b"hibr", b"rstr")
     except OSError:
         return None
 
@@ -750,6 +795,8 @@ def windows_summary(part: dict) -> dict:
     except Exception as e:
         info["system_hive_error"] = str(e) or type(e).__name__
     info["hibernated"] = hibernated(root)
+    info["write_safety"] = NTFS_STATE_TEXT.get(NTFS_STATES.get(part.get("device") or ""),
+                                               NTFS_STATES.get(part.get("device") or "", "unknown"))
     usage = shutil.disk_usage(root)
     info["free_gb"], info["size_gb"] = round(usage.free / 1e9, 1), round(usage.total / 1e9, 1)
     users = ci_path(root, "Users")
@@ -815,6 +862,9 @@ def get_overview() -> dict:
             flags.append(f"EFI partition {p['name']} has no Windows boot configuration (EFI/Microsoft/Boot/BCD).")
     for w in windows:
         where = f"Windows on {w['partition']}"
+        if NTFS_STATES.get(PARTS[w["partition"]].get("device") or "") == "unclean":
+            flags.append(f"{where} was not shut down cleanly (NTFS journal has unwritten changes; this is not "
+                         f"hibernation). Changes are blocked until it's fixed. {UNCLEAN_FIX}")
         if w.get("hibernated"):
             flags.append(f"{where} is hibernated (Fast Startup or hibernate): it was not fully shut down.")
         if w.get("free_gb", 99) < 5:
@@ -1335,25 +1385,31 @@ def undo_text(job: dict) -> str:
             None: "Nothing on the Windows disk changes."}[job["reversible"]]
 
 
+def approve_prompt(job: dict) -> str:
+    if job.get("confirm"):
+        return f"To approve, type {job['confirm']} and press Enter. Esc rejects."
+    return "Press Y to approve or N to reject."
+
+
 def print_card(job: dict) -> None:
     bar = "!" * 74
     lines = [bar, f"  CLAUDE ASKS TO CHANGE THIS PC  (job {job['id']}, risk: {job['risk']})", f"  {job['title']}"]
     lines += [f"    {d}" for d in job["details"]]
-    lines += [f"  Reason given by the AI: {job['ai_reason']}", "  " + undo_text(job),
-              "  Press Y to approve or N to reject.", bar]
+    lines += [f"  Reason given by the AI: {job['ai_reason']}", "  " + undo_text(job), "  " + approve_prompt(job), bar]
     print("\a\n" + "\n".join(lines), flush=True)
 
 
 def new_job(kind: str, title: str, details: list[str], risk: str, reason: str, run_fn,
-            reversible: bool | None = True, locked: bool = True) -> dict:
+            reversible: bool | None = True, locked: bool = True, confirm: str | None = None) -> dict:
     """Queue a change for approval on the PC's screen. run_fn(job) does the work once approved.
 
     reversible=None means the job only reads the Windows disk (backups). locked=False lets other tools
-    keep working while a long job runs (it must take _LOCK itself where it touches shared state)."""
+    keep working while a long job runs (it must take _LOCK itself where it touches shared state).
+    confirm is a word the person must type (instead of pressing Y) for the riskiest changes."""
     job = {"id": next(_JOB_IDS), "kind": kind, "title": title, "details": details, "risk": risk,
            "reversible": reversible, "ai_reason": reason, "state": "waiting_for_approval",
            "requested_at": dt.datetime.now().strftime("%H:%M:%S"), "result": None, "progress": None,
-           "_run": run_fn, "_created": time.time(), "_undo": None, "_locked": locked}
+           "confirm": confirm, "_run": run_fn, "_created": time.time(), "_undo": None, "_locked": locked}
     JOBS[job["id"]] = job
     ACTIVITY.append(f"{job['requested_at']}  AI ASKS TO CHANGE: {title} (job {job['id']})")
     log.info("Job %d requested: %s | %s | reason: %s", job["id"], title, " | ".join(details), reason)
@@ -1361,8 +1417,9 @@ def new_job(kind: str, title: str, details: list[str], risk: str, reason: str, r
         SCREEN.refresh()
     else:
         print_card(job)
+    how = f"type {confirm} and press Enter" if confirm else "press Y"
     return {"job_id": job["id"], "state": job["state"],
-            "note": "Nothing has changed yet. The person at the PC must press Y on its screen to approve. "
+            "note": f"Nothing has changed yet. The person at the PC must {how} on its screen to approve. "
                     "Tell them what you asked for and why, then check get_job_status every ~20 seconds."}
 
 
@@ -1417,33 +1474,68 @@ def release_caches() -> None:
     folder_names.cache_clear()
 
 
+UNCLEAN_FIX = ("Fix: request_windows_repair('chkdsk') lets Windows replay and repair its own journal (safest), "
+               "or request_reset_ntfs_journal discards the unwritten changes so writing works now.")
+
+
 def ntfs_hint(error: str) -> str:
+    """Which check stopped writing, in words the AI can act on, plus ntfs-3g's own message."""
     low = error.lower()
-    if "hibernat" in low:
-        return ("Windows is hibernated (Fast Startup or hibernate), so writing would damage it. "
-                "Use request_clear_hibernation first.")
-    if "unclean" in low or "metadata kept in windows cache" in low:
-        return ("Windows was not shut down cleanly, so writing could damage it. If Fast Startup is on, "
-                "request_clear_hibernation fixes this; otherwise chkdsk must run from Windows Recovery.")
-    return "Could not open the partition for writing: " + error.strip()
+    said = " ".join(error.split())[:300]
+    if "unclean" in low or "metadata kept in windows cache" in low:  # before "hibernat": this text mentions it too
+        return f"Writing is blocked: the partition was {NTFS_STATE_TEXT['unclean']}. {UNCLEAN_FIX} (ntfs-3g said: {said})"
+    if "is hibernated" in low:
+        return (f"Writing is blocked: Windows is {NTFS_STATE_TEXT['hibernated']}. Fix: request_clear_hibernation. "
+                f"(ntfs-3g said: {said})")
+    return f"Could not open the partition for writing. (ntfs-3g said: {said})"
+
+
+def check_ntfs_state(part: dict, extra_options: str = "") -> None:
+    """Refuse early, naming the exact check, when ntfs-3g would refuse to write this volume."""
+    state = NTFS_STATES.get(part.get("device") or "", "unknown")
+    if part["kind"] != "ntfs":
+        return
+    if state == "unclean":
+        raise UserError(f"Writing is blocked by the NTFS journal check: the partition was {NTFS_STATE_TEXT['unclean']}. "
+                        + UNCLEAN_FIX)
+    if state == "hibernated" and "remove_hiberfile" not in extra_options:
+        raise UserError(f"Writing is blocked by the hibernation check: Windows is {NTFS_STATE_TEXT['hibernated']}. "
+                        "Fix: request_clear_hibernation.")
+
+
+@contextlib.contextmanager
+def released(part: dict):
+    """Unmount one partition and make its device writable, for a single approved change; afterwards it is
+    always read-only and mounted again (and its NTFS state probed again)."""
+    dev, name = part["device"], part["name"]
+    WARMED.wait(120)  # don't unmount while the event log is still being indexed
+    with _LOCK:
+        release_caches()
+        close_restore_points({name})  # restore points read the raw device; never while it is written
+        if part.get("mountpoint") and run(["umount", part["mountpoint"]]).returncode != 0:
+            raise UserError("The partition is in use (maybe a shell on screen 2 is inside it). Close it and try again.")
+        part["mountpoint"] = None
+    try:
+        run(["blockdev", "--setrw", dev])
+        yield dev
+    finally:
+        with _LOCK:
+            part["mountpoint"], part["note"] = mount_readonly(dev, name, part["kind"])
+            release_caches()
 
 
 @contextlib.contextmanager
 def writable(part: dict, extra_options: str = ""):
     """Remount one partition read-write for a single approved change, then always back to read-only."""
+    if part["kind"] == "snapshot":
+        raise UserError("Restore points are read-only.")
     if not part.get("device"):  # --test-root folders are plain folders
         yield Path(part["mountpoint"])
         release_caches()
         return
-    dev, name = part["device"], part["name"]
-    WARMED.wait(120)  # don't unmount while the event log is still being indexed
-    release_caches()
-    if part.get("mountpoint") and run(["umount", part["mountpoint"]]).returncode != 0:
-        raise UserError("The partition is in use (maybe a shell on screen 2 is inside it). Close it and try again.")
-    part["mountpoint"] = None
-    target = MOUNT_BASE / name
-    try:
-        run(["blockdev", "--setrw", dev])
+    check_ntfs_state(part, extra_options)
+    with released(part) as dev:
+        target = MOUNT_BASE / part["name"]
         target.mkdir(parents=True, exist_ok=True)
         if part["kind"] == "efi":
             cmd = ["mount", "-t", "vfat", "-o", "rw", dev, str(target)]
@@ -1457,16 +1549,13 @@ def writable(part: dict, extra_options: str = ""):
         if not mounted or mounted[1]:
             # ntfs-3g quietly falls back to read-only on a hibernated or uncleanly shut-down volume
             run(["umount", str(target)])
-            raise UserError(ntfs_hint((p.stderr or p.stdout).strip() or "Windows is hibernated or unclean"))
+            raise UserError(ntfs_hint((p.stderr or p.stdout).strip() or "fell back to read-only"))
         try:
             yield target
         finally:
             run(["sync"])
             if run(["umount", str(target)]).returncode != 0:
                 run(["umount", "-l", str(target)])
-    finally:
-        part["mountpoint"], part["note"] = mount_readonly(dev, name, part["kind"])
-        release_caches()
 
 
 def check_can_change(part: dict) -> None:
@@ -1789,10 +1878,14 @@ def request_copy_file(source_path: str, target_path: str, reason: str, source_pa
 def request_clear_hibernation(reason: str, disable_fast_startup: bool = True, partition: str = "") -> dict:
     """Ask to remove Windows' hibernation file so the partition can be changed safely, and by default
     turn off Fast Startup so it doesn't come back. NOT reversible: anything left open in Windows apps
-    when it was hibernated is lost (a normal Fast Startup shutdown loses nothing)."""
+    when it was hibernated is lost (a normal Fast Startup shutdown loses nothing). This is the fix for
+    the hibernation check only; an unclean shutdown needs chkdsk or request_reset_ntfs_journal."""
     part = get_part(partition)
     check_can_change(part)
     root = Path(part["mountpoint"])
+    if NTFS_STATES.get(part.get("device") or "") == "unclean":
+        raise UserError(f"Windows isn't hibernated: the partition was {NTFS_STATE_TEXT['unclean']}. "
+                        f"Clearing hibernation can't fix that. {UNCLEAN_FIX}")
     cs = control_set(hive_root(open_hive(ci_path(root, "Windows/System32/config/SYSTEM"))))
     power_key = f"{cs}\\Control\\Session Manager\\Power"
 
@@ -1815,6 +1908,41 @@ def request_clear_hibernation(reason: str, disable_fast_startup: bool = True, pa
                "Anything left open in Windows apps when it hibernated is lost."]
     return new_job("clear_hibernation", "Clear Windows hibernation", details, "medium", reason, run_fn,
                    reversible=False)
+
+
+@tool(change=True)
+def request_reset_ntfs_journal(reason: str, partition: str = "") -> dict:
+    """Ask to reset the NTFS journal of a partition that wasn't shut down cleanly (Linux ntfsfix), so it
+    can be changed. It discards the metadata changes Windows hadn't written yet (usually its last few
+    seconds) and makes Windows check the disk at its next start. The safer fix is
+    request_windows_repair("chkdsk"); use this when that can't run. The person must type RESET."""
+    part = get_part(partition)
+    check_can_change(part)
+    if part["kind"] != "ntfs" or not part.get("device"):
+        raise UserError("Only NTFS partitions on a real disk have an NTFS journal.")
+    state = NTFS_STATES.get(part["device"], "unknown")
+    if state == "clean":
+        raise UserError("This partition was shut down cleanly; its journal doesn't need resetting.")
+    if state == "hibernated":
+        raise UserError("This partition is hibernated, not unclean: use request_clear_hibernation.")
+    if not shutil.which("ntfsfix"):
+        raise UserError("ntfsfix is not installed on this rescue system.")
+
+    def run_fn(job):
+        with released(part) as dev:
+            p = run(["ntfsfix", dev], timeout=300)
+        if p.returncode != 0:
+            raise UserError("ntfsfix failed: " + clip((p.stdout + p.stderr).strip(), 1500, tail=True))
+        after = NTFS_STATES.get(part["device"], "unknown")
+        return {"ntfsfix_output": clip(p.stdout.strip(), 3000), "partition_now": NTFS_STATE_TEXT.get(after, after)}
+
+    details = [f"Partition: {part['name']}", f"Now: {NTFS_STATE_TEXT.get(state, state)}",
+               "Runs: ntfsfix (Linux) to reset the NTFS journal and mark the partition for checking",
+               "Loses: changes Windows hadn't finished writing when it stopped (usually its last few seconds)",
+               "Windows runs chkdsk the next time it starts.",
+               "Safer alternative: Windows' own chkdsk (request_windows_repair chkdsk)."]
+    return new_job("reset_journal", "Reset the NTFS journal (ntfsfix)", details, "high", reason, run_fn,
+                   reversible=False, confirm="RESET")
 
 
 @tool(change=True)
@@ -1863,8 +1991,8 @@ def request_run_command(command: str, reason: str, writable_partitions: list[str
             for p in parts:
                 stack.enter_context(writable(p))
             try:
-                done = subprocess.run(["bash", "-c", command], capture_output=True, text=True, errors="replace",
-                                      timeout=600)
+                done = subprocess.run(["bash", "-c", command], stdin=subprocess.DEVNULL, capture_output=True,
+                                      text=True, errors="replace", timeout=600)
             except subprocess.TimeoutExpired:
                 raise UserError("The command timed out after 10 minutes.")
         out = done.stdout + (f"\n[stderr]\n{done.stderr}" if done.stderr.strip() else "")
@@ -1937,19 +2065,33 @@ def boot_disks() -> set[str]:
     names = set()
     for mp in ("/run/live/medium", "/cdrom", "/lib/live/mount/medium"):
         src = run(["findmnt", "-n", "-o", "SOURCE", mp]).stdout.strip()
+        if src.startswith("/dev/loop"):  # an ISO file on a stick (Ventoy and similar): find the stick
+            back = run(["losetup", "-n", "-O", "BACK-FILE", src]).stdout.strip()
+            if back:
+                src = run(["findmnt", "-n", "-o", "SOURCE", "-T", back]).stdout.strip() or src
         if src:
             tree = run(["lsblk", "-s", "-n", "-r", "-o", "NAME,TYPE", src]).stdout
             names |= {line.split()[0] for line in tree.splitlines() if line.endswith(" disk")}
     return names
 
 
+def disk_held(disk: str) -> bool:
+    """True if device-mapper or RAID holds the disk or a partition (e.g. Ventoy's boot mapping): it
+    can't be mounted ("Can't open blockdev")."""
+    base = Path("/sys/block") / disk
+    holders = [base / "holders"] + [p / "holders" for p in base.glob(f"{disk}*")]
+    return any(h.is_dir() and any(h.iterdir()) for h in holders)
+
+
 def usb_partitions(filesystems: set[str]) -> list[dict]:
-    """Partitions with one of these file systems on USB or removable drives, except the rescue stick."""
+    """Partitions with one of these file systems on USB or removable drives, except the rescue stick
+    and drives that are held by something else."""
     skip = boot_disks()
     found = []
     for disk in disks():
         removable = disk.get("tran") == "usb" or str(disk.get("rm")).lower() in ("1", "true")
-        if disk["name"] in skip or not removable:
+        labels = {(c.get("label") or c.get("partlabel") or "").upper() for c in disk.get("children") or []}
+        if disk["name"] in skip or not removable or disk_held(disk["name"]) or labels & {"VENTOY", "VTOYEFI"}:
             continue
         for part in disk.get("children") or [disk]:  # a stick may have no partition table
             fs = (part.get("fstype") or "").lower()
@@ -1965,12 +2107,28 @@ def backup_candidates() -> list[dict]:
 
 
 def find_backup_drive(name: str) -> dict:
+    """A backup drive that was just checked to be writable, with its free space ("free" in bytes)."""
     drives = backup_candidates()
     drive = next((d for d in drives if d["name"] == name.removeprefix("/dev/")), None)
     if not drive:
         raise UserError("Backup drive not found; call list_backup_drives (the person may need to plug one in). "
                         f"Available: {', '.join(d['name'] for d in drives) or 'none'}")
-    return drive
+    status = check_drive(drive)
+    if not status["usable"]:
+        raise UserError(f"{drive['name']} can't be written: {status['why_not']}")
+    return {**drive, "free": status["free"]}
+
+
+def check_drive(drive: dict) -> dict:
+    """Mount the drive read-write and write a test file: only drives that pass are used for backups."""
+    try:
+        with drive_mounted(drive) as m:
+            probe = m / ".rescue-ai-write-test"
+            probe.write_bytes(b"ok")
+            probe.unlink()
+            return {"usable": True, "free": shutil.disk_usage(m).free}
+    except (UserError, OSError) as e:
+        return {"usable": False, "why_not": str(e)}
 
 
 @contextlib.contextmanager
@@ -2145,12 +2303,16 @@ def run_backup(job: dict, sources: list[tuple[Path, str]], drive: dict, folder: 
 
 @tool
 def list_backup_drives() -> dict:
-    """USB drives that can receive a backup, with free space. The rescue stick itself is never listed."""
+    """USB drives that can receive a backup, with free space; each was test-written just now. The rescue
+    stick itself (also when started through Ventoy) is never listed."""
     drives = backup_candidates()
     for d in drives:
-        with contextlib.suppress(UserError, OSError):
-            with drive_mounted(d, read_only=True) as m:
-                d["free_gb"] = round(shutil.disk_usage(m).free / 1e9, 1)
+        status = check_drive(d)
+        d["usable"] = status["usable"]
+        if status["usable"]:
+            d["free_gb"] = round(status["free"] / 1e9, 1)
+        else:
+            d["why_not"] = status["why_not"]
     if not drives:
         return {"drives": [], "note": "No USB drive found. Ask the person to plug one in (exFAT or NTFS works "
                                       "best; FAT32 can't hold files over 4 GB)."}
@@ -2175,8 +2337,7 @@ def request_backup(sources: list[str], destination: str, reason: str, partition:
             with contextlib.suppress(OSError):
                 total_bytes += f.stat().st_size
                 total_files += 1
-    with drive_mounted(drive, read_only=True) as m:
-        free = shutil.disk_usage(m).free
+    free = drive["free"]
     part = get_part(partition)
     pc = (windows_summary(part).get("computer_name") if part["windows"] else None) or part["name"]
     folder = f"{pc}_{dt.date.today():%Y-%m-%d}"
@@ -2217,8 +2378,7 @@ def request_disk_image(partition: str, destination: str, reason: str) -> dict:
         raise UserError("ddrescue is not installed on this rescue system.")
     drive = find_backup_drive(destination)
     size = int(run(["blockdev", "--getsize64", part["device"]]).stdout.strip() or 0)
-    with drive_mounted(drive, read_only=True) as m:
-        free = shutil.disk_usage(m).free
+    free = drive["free"]
     if drive["fstype"] == "vfat" and size > 4 * 2**30 - 1:
         raise UserError("The backup drive uses FAT32, which can't hold a file over 4 GB. Use an exFAT or NTFS drive.")
     if size > free:
@@ -2230,7 +2390,8 @@ def request_disk_image(partition: str, destination: str, reason: str) -> dict:
             folder.mkdir(parents=True, exist_ok=True)
             image, mapfile = folder / f"{part['name']}.img", folder / f"{part['name']}.map"
             proc = subprocess.Popen(["ddrescue", "-r2", part["device"], str(image), str(mapfile)],
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, errors="replace")
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                    text=True, errors="replace")
             while proc.poll() is None:
                 if job.get("_cancel"):
                     proc.terminate()
@@ -2274,6 +2435,7 @@ def cancel_job(job_id: int) -> dict:
 
 
 QEMU = "qemu-system-x86_64"
+os.environ.setdefault("MTOOLS_SKIP_CHECK", "1")  # mtools: don't stop to question the disk images' geometry
 OVMF_PAIRS = [("/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_VARS_4M.fd"),
               ("/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/OVMF/OVMF_VARS.fd")]
 ESP_TYPE = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B"
@@ -2432,20 +2594,34 @@ def fat_image(path: Path, size_mb: int, esp: bool, files: dict[str, Path]) -> No
     if p.returncode != 0:
         raise UserError("Could not format a disk image: " + (p.stderr or p.stdout).strip())
     image = f"{path}@@1M"
+    made: set[str] = set()
     for dest, src in files.items():
         folder = ""
         for name in dest.strip("/").split("/")[:-1]:
             folder += "/" + name
-            run(["mmd", "-i", image, "::" + folder])  # fails harmlessly if it exists
-        p = run(["mcopy", "-o", "-i", image, str(src), "::" + dest])
+            if folder in made:  # mmd would ask what to do about an existing folder
+                continue
+            p = mtools("mmd", "-D", "s", "-i", image, "::" + folder)
+            if p.returncode != 0:
+                raise UserError(f"Could not create {folder} in a disk image: {(p.stderr or p.stdout).strip()}")
+            made.add(folder)
+        p = mtools("mcopy", "-o", "-i", image, str(src), "::" + dest)
         if p.returncode != 0:
-            raise UserError(f"Could not copy {dest} into a disk image: {p.stderr.strip()}")
+            raise UserError(f"Could not copy {dest} into a disk image: {(p.stderr or p.stdout).strip()}")
+
+
+def mtools(*args: str, timeout: int = 900) -> subprocess.CompletedProcess:
+    """Run an mtools command: never interactive (no keyboard, no sanity prompts), time for big files."""
+    try:
+        return run(list(args), timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise UserError(f"{' '.join(args[:4])} took longer than {timeout} seconds and was stopped.")
 
 
 def read_from_image(path: Path, name: str) -> bytes | None:
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp) / "file"
-        p = run(["mcopy", "-n", "-i", f"{path}@@1M", "::/" + name, str(out)])
+        p = mtools("mcopy", "-n", "-i", f"{path}@@1M", "::/" + name, str(out))
         return out.read_bytes() if p.returncode == 0 and out.exists() else None
 
 
@@ -2469,6 +2645,7 @@ def disk_for_vm(disk: str, job: dict):
     WARMED.wait(120)
     with _LOCK:
         release_caches()
+        close_restore_points({p["name"] for p in parts})
         for p in parts:
             if p.get("mountpoint") and run(["umount", p["mountpoint"]]).returncode != 0:
                 remount()
@@ -2508,7 +2685,7 @@ def run_vm(disk_dev: str, boot_img: Path, job_img: Path, minutes: int, workdir: 
            "-device", "ide-hd,drive=job,bus=ahci.2"]
     log_file = workdir / "qemu.log"
     with open(log_file, "w") as out:
-        proc = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT)
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT)
         try:
             proc.wait(timeout=minutes * 60)
         except subprocess.TimeoutExpired:
@@ -2692,6 +2869,312 @@ def request_windows_repair(repair: str, reason: str, partition: str = "", packag
                    reversible=False, locked=False)
 
 
+# ---------------------------------------------------------------- restore points, registry health, multi-file fixes
+
+
+RESTORE_MOUNTS = Path("/mnt/rescue-restore")
+# hive -> keys a healthy hive always has (checked without reading any values)
+HIVE_KEYS = {
+    "SYSTEM": ["Select", "ControlSet001\\Control", "ControlSet001\\Services", "ControlSet001\\Control\\ComputerName"],
+    "SOFTWARE": ["Microsoft\\Windows NT\\CurrentVersion", "Microsoft\\Windows\\CurrentVersion", "Classes"],
+    "SAM": ["SAM"],
+    "SECURITY": ["Policy"],
+    "DEFAULT": ["Control Panel", "Software"],
+    "COMPONENTS": [],
+    "DRIVERS": [],
+}
+RESTORABLE_HIVES = ("SYSTEM", "SOFTWARE", "DEFAULT", "COMPONENTS", "DRIVERS")
+STAGING_LIMIT = 2 * 2**30  # files are read into memory before the partition is written
+
+
+def vss_stores(part: dict) -> list[dict]:
+    """Restore points (Volume Shadow Copy stores) on an NTFS partition, from vshadowinfo."""
+    if not part.get("device"):
+        raise UserError("Restore points need a real disk.")
+    if not shutil.which("vshadowinfo"):
+        raise UserError("Restore-point support (vshadowinfo, from libvshadow-utils) isn't installed.")
+    p = run(["vshadowinfo", part["device"]], timeout=120)
+    if p.returncode != 0:
+        raise UserError("Could not read restore points: " + clip((p.stderr or p.stdout).strip(), 500))
+    stores = []
+    for block in re.split(r"\n(?=Store: \d+)", p.stdout):
+        if m := re.match(r"Store: (\d+)", block.strip()):
+            created = re.search(r"Creation time\s*:\s*(.+)", block)
+            stores.append({"restore_point": f"{part['name']}@rp{m.group(1)}",
+                           "created": created.group(1).strip() if created else None})
+    return stores
+
+
+def open_restore_point(base_name: str, number: int) -> dict:
+    """Mount restore point <number> of a partition read-only, as partition "<partition>@rp<number>"."""
+    base = PARTS.get(base_name)
+    if not base or base["kind"] != "ntfs" or not base.get("device"):
+        raise UserError(f"{base_name!r} isn't an NTFS partition with restore points.")
+    name = f"{base_name}@rp{number}"
+    stores = RESTORE_MOUNTS / f"{base_name}-stores"
+    snapshot = stores / f"vss{number}"
+    if not snapshot.exists():
+        if not shutil.which("vshadowmount"):
+            raise UserError("Restore-point support (vshadowmount, from libvshadow-utils) isn't installed.")
+        if os.path.ismount(stores):
+            raise UserError(f"There's no restore point {number}; see list_restore_points.")
+        stores.mkdir(parents=True, exist_ok=True)
+        with open(RESTORE_MOUNTS / f"{base_name}-vshadowmount.log", "w") as out:
+            subprocess.Popen(["vshadowmount", base["device"], str(stores)], stdin=subprocess.DEVNULL, stdout=out,
+                             stderr=subprocess.STDOUT, start_new_session=True)
+        for _ in range(60):
+            if snapshot.exists():
+                break
+            time.sleep(0.5)
+        else:
+            raise UserError(f"Restore point {number} could not be opened (see list_restore_points).")
+    target = RESTORE_MOUNTS / name
+    target.mkdir(parents=True, exist_ok=True)
+    if not os.path.ismount(target):
+        errors = []
+        for fs in ("ntfs3", "ntfs-3g"):
+            p = run(["mount", "-t", fs, "-o", "ro,loop", str(snapshot), str(target)])
+            if p.returncode == 0:
+                break
+            errors.append(p.stderr.strip())
+        else:
+            raise UserError(f"Restore point {number} could not be mounted: " + " | ".join(errors))
+    part = {"name": name, "device": None, "disk": None, "base": base_name, "kind": "snapshot",
+            "label": f"restore point {number} of {base_name}", "size_gb": base["size_gb"],
+            "mountpoint": str(target), "note": "", "windows": False, "disk_failed": False}
+    PARTS[name] = part
+    return part
+
+
+def close_restore_points(bases: set[str] | None = None) -> None:
+    """Unmount restore points (all, or those of these partitions) before their partition is written."""
+    for name, p in list(PARTS.items()):
+        if p["kind"] == "snapshot" and (bases is None or p["base"] in bases):
+            if p.get("mountpoint"):
+                run(["umount", p["mountpoint"]])
+            del PARTS[name]
+    if RESTORE_MOUNTS.exists():
+        for stores in RESTORE_MOUNTS.glob("*-stores"):
+            if (bases is None or stores.name[:-len("-stores")] in bases) and os.path.ismount(stores):
+                run(["umount", str(stores)])
+
+
+def restore_point(name: str) -> tuple[dict, dict]:
+    """(restore point, its live partition) for a name like "nvme0n1p3@rp2"."""
+    rp = get_part(name)
+    if rp["kind"] != "snapshot":
+        raise UserError("Give a restore point from list_restore_points, e.g. nvme0n1p3@rp2.")
+    return rp, PARTS[rp["base"]]
+
+
+def hive_health(path: Path | None, keys: list[str]) -> dict:
+    """Can this registry file be opened, and does it have the keys every healthy one has?"""
+    if path is None:
+        return {"status": "DAMAGED: missing"}
+    st = path.stat()
+    info = {"size_mb": round(st.st_size / 2**20, 1), "modified": mtime_str(path)}
+    with open(path, "rb") as f:
+        head = f.read(4)
+    if st.st_size == 0 or head != b"regf":
+        return {**info, "status": "DAMAGED: " + ("empty (0 bytes)" if st.st_size == 0 else "not a registry file")}
+    try:
+        top = hive_root(open_hive(path))
+    except Exception as e:
+        return {**info, "status": f"DAMAGED: can't be opened ({type(e).__name__}: {e})"}
+    missing = []
+    for key in keys:
+        try:
+            subkey(top, key)
+        except Exception:
+            missing.append(key)
+    status = "ok" if not missing else "DAMAGED: missing " + ", ".join(missing)
+    if hive_dirty(path):
+        status += " (has changes waiting in its .LOG files)"
+    logs = {ext: lp.stat().st_size for ext in ("LOG1", "LOG2") if (lp := ci_path(path.parent, f"{path.name}.{ext}"))}
+    return {**info, "status": status, "log_files_bytes": logs}
+
+
+def stage(sources: list[tuple[str, Path]], folder: Path) -> dict[str, Path]:
+    """Copy files to a temporary folder before the partition they go to is opened for writing."""
+    if gone := [rel for rel, src in sources if src is None]:
+        raise UserError("No longer there: " + ", ".join(gone))
+    if sum(src.stat().st_size for _, src in sources) > STAGING_LIMIT:
+        raise UserError("Too much at once (over 2 GB); split it into smaller requests.")
+    staged = {}
+    for i, (rel, src) in enumerate(sources):
+        staged[rel] = folder / f"{i}-{src.name}"
+        shutil.copy2(src, staged[rel])
+    return staged
+
+
+def replace_files(job: dict, part: dict, staged: dict[str, Path], rels: list[str]) -> dict:
+    """Put staged files in place on a partition; a rel without a staged file is removed. Every current
+    file is kept in the undo folder first, so request_undo can put it all back."""
+    replaced, removed, records = [], [], []
+    with writable(part) as root:
+        folder = undo_folder(root, job)
+        for i, rel in enumerate(rels):
+            parent = ci_path(root, str(Path(rel).parent))
+            if parent is None:
+                raise UserError(f"The folder for {rel} does not exist on {part['name']}.")
+            target = ci_path(root, rel) or parent / Path(rel).name
+            backup = None
+            if target.exists():
+                saved = folder / "original" / f"{i}-{target.name}"
+                saved.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(target, saved)
+                backup = rel_to(root, saved)
+            if rel in staged:
+                shutil.copy2(staged[rel], target)
+                replaced.append(rel)
+            elif target.exists():
+                os.remove(target)
+                removed.append(rel)
+            else:
+                continue
+            records.append({"type": "copy", "part": part["name"], "target": rel_to(root, target), "backup": backup})
+        record_undo(job, root, folder, records)
+    return {"replaced": replaced, "removed": removed}
+
+
+@tool
+def list_restore_points(partition: str = "") -> dict:
+    """Windows restore points (Volume Shadow Copies) on a partition, oldest first, with their dates.
+    Use "<partition>@rp<N>" as the partition in list_directory, read_text_file, read_registry and
+    check_registry to look inside one (read-only); bring things back with
+    request_restore_from_restore_point or request_restore_registry_hive. Look at restore points
+    before changing the partition: changes made from here aren't recorded in them."""
+    part = get_part(partition)
+    if part["kind"] == "snapshot":
+        part = PARTS[part["base"]]
+    stores = vss_stores(part)
+    return {"partition": part["name"], "count": len(stores), "restore_points": stores or "none"}
+
+
+@tool
+def check_registry(partition: str = "") -> dict:
+    """Health of every Windows registry file (SYSTEM, SOFTWARE, SAM, SECURITY, DEFAULT, COMPONENTS,
+    DRIVERS and each user's NTUSER.DAT): opens each one and checks that its core keys exist, e.g.
+    SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion. Works on a restore point too ("<partition>@rpN")."""
+    part = get_part(partition)
+    root = Path(part["mountpoint"])
+    config = ci_path(root, "Windows/System32/config")
+    if config is None:
+        raise UserError("There's no Windows registry on this partition.")
+    report = {name: hive_health(ci_path(config, name), keys) for name, keys in HIVE_KEYS.items()}
+    users = ci_path(root, "Users")
+    for user in sorted(os.listdir(users)) if users else []:
+        if (users / user).is_dir() and (nt := ci_path(users / user, "NTUSER.DAT")):
+            report[f"NTUSER:{user}"] = hive_health(nt, ["Software"])
+    damaged = [name for name, h in report.items() if not h["status"].startswith("ok")]
+    return {"partition": part["name"], "damaged": damaged or "none", "hives": report}
+
+
+@tool(change=True)
+def request_restore_registry_hive(hive: str, restore_point_name: str, reason: str) -> dict:
+    """Ask to put back one registry hive (SYSTEM, SOFTWARE, DEFAULT, COMPONENTS or DRIVERS) from a
+    restore point when the current one is damaged (see check_registry). Its .LOG1/.LOG2 files are
+    replaced too, so Windows doesn't replay old log entries onto it, and the current files are kept for
+    request_undo. Settings, updates and programs added after that restore point may need redoing.
+    The person must type RESTORE to approve."""
+    name = hive.strip().upper()
+    if name not in RESTORABLE_HIVES:
+        raise UserError(f"hive must be one of {', '.join(RESTORABLE_HIVES)}.")
+    rp, base = restore_point(restore_point_name)
+    check_can_change(base)
+    check_ntfs_state(base)
+    rel = f"Windows/System32/config/{name}"
+    old = hive_health(ci_path(Path(rp["mountpoint"]), rel), HIVE_KEYS[name])
+    if not old["status"].startswith("ok"):
+        raise UserError(f"The restore point's {name} hive isn't healthy either: {old['status']}")
+    now = hive_health(ci_path(Path(base["mountpoint"]), rel), HIVE_KEYS[name])
+    rels = [rel, f"{rel}.LOG1", f"{rel}.LOG2"]
+
+    def run_fn(job):
+        with tempfile.TemporaryDirectory() as tmp:
+            # read everything from the restore point first: it is closed while the partition is written
+            source, _ = restore_point(restore_point_name)
+            found = [(r, f) for r in rels if (f := ci_path(Path(source["mountpoint"]), r))]
+            return replace_files(job, base, stage(found, Path(tmp)), rels)
+
+    details = [f"Registry hive: {name} on {base['name']}",
+               f"Now: {now['status']} ({now.get('size_mb', '?')} MB, changed {now.get('modified', '?')})",
+               f"From {restore_point_name}: {old['status']} ({old.get('size_mb')} MB, from {old.get('modified')})",
+               f"Also replaces {name}.LOG1 and {name}.LOG2, so old log entries aren't replayed onto it",
+               "Settings, updates and programs added since then may need redoing."]
+    return new_job("restore_hive", f"Restore the {name} registry from a restore point", details, "high", reason,
+                   run_fn, confirm="RESTORE")
+
+
+@tool(change=True)
+def request_restore_from_restore_point(restore_point_name: str, paths: list[str], reason: str) -> dict:
+    """Ask to bring back up to 20 files from a restore point to the same place on the live partition, in
+    one approval (e.g. damaged system files or drivers). Current files are kept for request_undo.
+    For registry files use request_restore_registry_hive."""
+    rp, base = restore_point(restore_point_name)
+    check_can_change(base)
+    check_ntfs_state(base)
+    if not 1 <= len(paths) <= 20:
+        raise UserError("Give between 1 and 20 paths.")
+    items = []
+    for path in paths:
+        _, src = resolve(path, restore_point_name)
+        if src.is_dir():
+            raise UserError(f"{path} is a folder; list the files.")
+        rel = rel_to(rp["mountpoint"], src)
+        check_write_path(rel)
+        items.append((rel, src.stat().st_size))
+
+    def run_fn(job):
+        with tempfile.TemporaryDirectory() as tmp:
+            source, _ = restore_point(restore_point_name)
+            found = [(r, ci_path(Path(source["mountpoint"]), r)) for r, _ in items]
+            return replace_files(job, base, stage(found, Path(tmp)), [r for r, _ in items])
+
+    details = [f"From: {restore_point_name}  To: {base['name']} (same places)"]
+    details += [f"{r}  ({size:,} bytes)" for r, size in items[:10]]
+    if len(items) > 10:
+        details.append(f"... and {len(items) - 10} more")
+    return new_job("restore_files", f"Bring back {len(items)} file(s) from a restore point", details, "medium",
+                   reason, run_fn)
+
+
+@tool(change=True)
+def request_copy_files(copies: list[dict], reason: str) -> dict:
+    """Ask to copy several files in one approval (up to 20), e.g. replace three damaged drivers. Each
+    item is {"source": path, "target": path, "source_partition": optional}; every target is on the
+    same partition (target_partition, default the Windows partition). Existing targets are backed up
+    first; reversible with request_undo."""
+    if not 1 <= len(copies) <= 20:
+        raise UserError("Give between 1 and 20 copies.")
+    targets = {c.get("target_partition", "") for c in copies}
+    if len(targets) > 1:
+        raise UserError("All targets must be on one partition; split the request.")
+    dst_part = get_part(targets.pop())
+    check_can_change(dst_part)
+    check_ntfs_state(dst_part)
+    items = []
+    for c in copies:
+        src_part, src = resolve(str(c.get("source", "")), c.get("source_partition", ""))
+        if src.is_dir():
+            raise UserError(f"{c.get('source')} is a folder; list the files.")
+        check_readable(src_part, src)
+        dst_rel = re.sub(r"^[A-Za-z]:", "", str(c.get("target", "")).strip()).replace("\\", "/").strip("/")
+        check_write_path(dst_rel)
+        parent = ci_path(Path(dst_part["mountpoint"]), str(Path(dst_rel).parent))
+        if parent is None or not parent.is_dir():
+            raise UserError(f"The folder for {dst_rel} does not exist.")
+        items.append((src_part["name"], rel_to(src_part["mountpoint"], src), dst_rel, src.stat().st_size))
+
+    def run_fn(job):
+        with tempfile.TemporaryDirectory() as tmp:
+            found = [(dst, ci_path(Path(get_part(sp)["mountpoint"]), sr)) for sp, sr, dst, _ in items]
+            return replace_files(job, dst_part, stage(found, Path(tmp)), [dst for _, _, dst, _ in items])
+
+    details = [f"{sp}: {sr}  ->  {dst_part['name']}: {dst}  ({size:,} bytes)" for sp, sr, dst, size in items]
+    return new_job("copy_files", f"Copy {len(items)} files to {dst_part['name']}", details, "medium", reason, run_fn)
+
+
 # ---------------------------------------------------------------- server
 
 
@@ -2813,7 +3296,8 @@ class Tunnel:
             try:
                 self.proc = subprocess.Popen(
                     [self.binary, "tunnel", "--no-autoupdate", "--url", f"http://127.0.0.1:{self.port}"],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, errors="replace")
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                    errors="replace")
             except OSError as e:
                 self._set(f"Could not start cloudflared: {e}")
                 time.sleep(10)
@@ -2909,7 +3393,7 @@ class Screen:
             for d in job["details"]:
                 lines += wrapped(d, 5)
             lines += wrapped(f"Reason given by the AI: {job['ai_reason']}", 3)
-            lines += ["   " + undo_text(job), "", "   Press Y to approve or N to reject.", "!" * cols, ""]
+            lines += ["   " + undo_text(job), "", "   " + approve_prompt(job), "!" * cols, ""]
         elif running := next((j for j in JOBS.values() if j["state"] == "running"), None):
             lines += wrapped(f"Working on: {running['title']}", 1)
             lines += wrapped(running.get("progress") or "", 3) + [""]
@@ -2924,7 +3408,9 @@ class Screen:
         if free > 1:
             lines += [" What Claude is doing:"] + ["   " + a for a in list(ACTIVITY)[-(free - 1):]]
         lines = lines[: rows - 1] + [""] * (rows - 1 - len(lines))
-        if waiting:
+        if waiting and waiting[0].get("confirm"):
+            footer = f" Type {waiting[0]['confirm']} + Enter to approve   [Esc] reject   typed: {TYPED['text']}"
+        elif waiting:
             footer = " [Y] approve   [N] reject"
         else:
             footer = " [L] new link   [S] stop sharing   [E] expert mode   [P] power off"
@@ -2935,9 +3421,12 @@ class Screen:
 _TTY_STATE = None  # (fd, settings) to restore when the agent exits
 
 
+TYPED = {"text": ""}  # letters typed for a change that needs a confirmation word
+
+
 def key_loop(link) -> None:
-    """Keys on the PC: Y/N decide the waiting change; L, S, E and P manage the link, expert mode and power."""
-    global EXPERT, _TTY_STATE
+    """Read keys from the PC's keyboard (see handle_key)."""
+    global _TTY_STATE
     try:
         import termios
         import tty
@@ -2951,24 +3440,51 @@ def key_loop(link) -> None:
         data = os.read(fd, 1)
         if not data:
             return
-        key = data.decode(errors="ignore").lower()
-        if key in ("y", "n"):
-            decide(key == "y")
-        elif key == "l":
-            link.new_link()
-        elif key == "s":
-            link.stop()
-        elif key == "e":
-            EXPERT = not EXPERT
-            word = "ON: Claude may ask to run commands (each one still needs Y)" if EXPERT else "OFF"
-            ACTIVITY.append(f"{dt.datetime.now():%H:%M:%S}  Expert mode {word}")
-            log.info("Expert mode %s", word)
-        elif key == "p" and SCREEN:
-            link.close()
-            unmount_ours()
-            subprocess.Popen(["systemctl", "poweroff"])
+        handle_key(data.decode(errors="ignore"), link)
+
+
+def handle_key(key: str, link) -> None:
+    """Y/N decide the waiting change (or type its confirmation word + Enter); L, S, E and P manage the
+    link, expert mode and power."""
+    global EXPERT
+    waiting = pending_jobs()
+    word = waiting[0].get("confirm") if waiting else None
+    if word:  # every key goes to the confirmation word, so letters can't trigger anything else
+        if key in ("\r", "\n"):
+            ok = TYPED["text"] == word
+            TYPED["text"] = ""
+            if ok:
+                decide(True)
+            elif not SCREEN:
+                print(f"  That wasn't {word}. Type {word} and press Enter, or Esc to reject.", flush=True)
+        elif key in ("\x1b",) or (key.lower() == "n" and not TYPED["text"]):
+            TYPED["text"] = ""
+            decide(False)
+        elif key in ("\x7f", "\b"):
+            TYPED["text"] = TYPED["text"][:-1]
+        elif key.isalpha():
+            TYPED["text"] = (TYPED["text"] + key.upper())[-20:]
         if SCREEN:
             SCREEN.refresh()
+        return
+    key = key.lower()
+    if key in ("y", "n"):
+        decide(key == "y")
+    elif key == "l":
+        link.new_link()
+    elif key == "s":
+        link.stop()
+    elif key == "e":
+        EXPERT = not EXPERT
+        state = "ON: Claude may ask to run commands (each one still needs Y)" if EXPERT else "OFF"
+        ACTIVITY.append(f"{dt.datetime.now():%H:%M:%S}  Expert mode {state}")
+        log.info("Expert mode %s", state)
+    elif key == "p" and SCREEN:
+        link.close()
+        unmount_ours()
+        subprocess.Popen(["systemctl", "poweroff"], stdin=subprocess.DEVNULL)
+    if SCREEN:
+        SCREEN.refresh()
 
 
 def restore_tty() -> None:

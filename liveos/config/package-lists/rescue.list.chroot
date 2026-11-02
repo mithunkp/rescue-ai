@@ -12,10 +12,15 @@ ca-certificates
 firmware-realtek
 firmware-linux-free
 
-# Rescue agent runtime (hivex edits the offline Windows registry)
+# Rescue agent runtime (hivex edits the offline Windows registry; hivexsh etc. for expert mode)
 python3
 python3-venv
 python3-hivex
+libhivex-bin
+
+# Windows restore points (Volume Shadow Copies)
+libvshadow-utils
+fuse3
 
 # Backups: disk images of failing disks
 gddrescue

@@ -23,8 +23,8 @@ echo "[2/4] Installing system tools..."
 if ! command -v smartctl >/dev/null || ! python3 -c "import ensurepip, hivex" 2>/dev/null; then
   apt-get update -qq
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-    smartmontools python3-venv python3-hivex ntfs-3g gddrescue \
-    qemu-system-x86 ovmf wimtools mtools dosfstools fdisk >/dev/null
+    smartmontools python3-venv python3-hivex libhivex-bin ntfs-3g gddrescue \
+    qemu-system-x86 ovmf wimtools mtools dosfstools fdisk libvshadow-utils fuse3 >/dev/null
 fi
 
 echo "[3/4] Setting up Python packages (the first run takes a minute)..."
