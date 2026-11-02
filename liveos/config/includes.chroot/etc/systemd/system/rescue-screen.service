@@ -24,6 +24,9 @@ UtmpMode=user
 Environment=WLR_RENDERER=pixman WLR_NO_HARDWARE_CURSORS=1 MOZ_ENABLE_WAYLAND=1
 # Wait until the agent has written the page address (it holds a per-boot key)
 ExecStartPre=/bin/sh -c 'for i in $(seq 360); do [ -s /run/rescue-ai/ui-url ] && exit 0; sleep 0.5; done; exit 1'
+# Show screen 7: logind only hands the display to the session on the screen being shown, and the
+# boot leaves screen 1 (the text screen) in front. Without this, cage times out waiting.
+ExecStartPre=+/usr/bin/chvt 7
 ExecStart=/bin/sh -c 'exec /usr/bin/cage -s -- /usr/bin/firefox-esr --kiosk --private-window "$(cat /run/rescue-ai/ui-url)"'
 ExecStopPost=+/usr/bin/chvt 1
 Restart=on-failure
