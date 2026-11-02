@@ -33,8 +33,10 @@ import textwrap
 import threading
 import time
 import xml.etree.ElementTree as ET
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlparse
 
 import anyio
 import uvicorn
@@ -256,6 +258,8 @@ def tool(fn=None, *, change: bool = False, locked: bool = True):
         shown = ", ".join(f"{k}={v!r}" for k, v in kwargs.items())
         line = f"{dt.datetime.now():%H:%M:%S}  AI -> {fn.__name__}({shown})"
         ACTIVITY.append(line)
+        if fn.__name__ in TOOL_WORDS:
+            LAST_ACTION["text"] = f"Claude {TOOL_WORDS[fn.__name__]}."
         if SCREEN:
             SCREEN.refresh()
         log.info("AI -> %s(%s)", fn.__name__, shown)
@@ -1433,6 +1437,7 @@ def decide(approve: bool) -> None:
     job["decided_at"] = dt.datetime.now().strftime("%H:%M:%S")
     word = "APPROVED" if approve else "rejected"
     ACTIVITY.append(f"{job['decided_at']}  Owner {word} job {job['id']}: {job['title']}")
+    LAST_ACTION["text"] = f"You {word.lower()}: {job['title']}."
     log.info("Job %d %s at the PC", job["id"], word)
     if not SCREEN:
         print(f"  Job {job['id']} {word}.", flush=True)
@@ -1455,6 +1460,8 @@ def run_job(job: dict) -> None:
             job["state"], job["result"] = "failed", {"error": f"{type(e).__name__}: {e}"}
     line = f"{dt.datetime.now():%H:%M:%S}  Job {job['id']} {job['state'].upper()}: {job['title']}"
     ACTIVITY.append(line)
+    LAST_ACTION["text"] = (f"Done: {job['title']}." if job["state"] == "done"
+                           else f"Didn't work: {job['title']}. Claude can see why.")
     log.info("%s | %s", line, job["result"])
     if SCREEN:
         SCREEN.refresh()
@@ -3330,6 +3337,309 @@ class Tunnel:
             self.proc.terminate()
 
 
+# ---------------------------------------------------------------- the PC's screen as a calm, minimal page
+
+
+UI_PORT = 8766  # the PC's own screen; only 127.0.0.1, never reachable through the link
+UI_KEY = secrets.token_urlsafe(16)
+UI_URL_FILE = Path("/run/rescue-ai/ui-url")  # read by the kiosk window service
+LINK = None  # the link (Tunnel) the screen controls
+CONSOLE_MODE = False
+SUMMARY = {"text": "Looking for Windows..."}
+LAST_ACTION = {"text": ""}
+TOOL_WORDS = {  # what Claude is doing, in plain words, for the screen
+    "get_overview": "is getting an overview of this PC", "list_disks": "is looking at the disks",
+    "disk_health": "is checking the disk's health", "windows_info": "is reading Windows' details",
+    "query_event_log": "is reading Windows' event logs", "crash_history": "is checking the crash history",
+    "boot_check": "is checking how the PC starts", "recent_updates": "is checking Windows updates",
+    "recent_drivers": "is checking drivers", "read_registry": "is reading Windows settings",
+    "list_directory": "is looking at files", "read_text_file": "is reading a log file",
+    "run_diagnostic": "is checking the hardware", "list_backup_drives": "is looking for a backup drive",
+    "list_installed_updates": "is checking installed updates",
+    "list_third_party_drivers": "is checking installed drivers",
+    "check_repair_tools": "is checking Windows' repair tools", "list_restore_points": "is looking at restore points",
+    "check_registry": "is checking the Windows registry",
+}
+
+
+def pc_summary() -> str:
+    """One sentence about what was found, for the screen."""
+    warning = (" The disk reports failing health: back up your files first."
+               if any(p.get("disk_failed") for p in PARTS.values()) else "")
+    wins = [p for p in PARTS.values() if p["windows"]]
+    if wins:
+        try:
+            with _LOCK:
+                name = windows_summary(wins[0]).get("windows") or "Windows"
+        except Exception:
+            name = "Windows"
+        return f"{name} was found. It stays read-only until you approve a change.{warning}"
+    if any(p["kind"] == "bitlocker" for p in PARTS.values()):
+        return f"The Windows drive is locked by BitLocker; it needs the recovery key.{warning}"
+    return f"No Windows installation was found on this PC's disks.{warning}"
+
+
+@functools.lru_cache(maxsize=4)
+def qr_svg(text: str) -> str:
+    import qrcode
+    import qrcode.image.svg
+
+    return qrcode.make(text, image_factory=qrcode.image.svg.SvgPathImage, border=0).to_string(encoding="unicode")
+
+
+def ui_state() -> dict:
+    link = LINK
+    url, sharing = getattr(link, "url", None), getattr(link, "sharing", True)
+    status = getattr(link, "status", "Starting...")
+    waiting = pending_jobs()
+    running = next((j for j in JOBS.values() if j["state"] == "running"), None)
+    card = None
+    if waiting:
+        j = waiting[0]
+        card = {"id": j["id"], "title": j["title"], "details": j["details"], "reason": j["ai_reason"],
+                "risk": j["risk"], "undo": undo_text(j), "confirm": j.get("confirm"), "more": len(waiting) - 1}
+    if running:
+        headline, lead = "Working on it.", running["title"]
+    elif not sharing:
+        headline, lead = "Sharing is off.", "Nobody can reach this PC now. Choose New link to share it again."
+    elif url:
+        headline, lead = "Ready.", "Add this link to Claude to begin."
+    elif "network" in status.lower():
+        headline, lead = "Plug in the network cable.", "Rescue AI will connect by itself."
+    else:
+        headline, lead = "Starting.", status
+    return {"headline": headline, "lead": lead, "url": url,
+            "qr": qr_svg(url) if url and not running else "", "card": card,
+            "working": {"progress": running.get("progress") or "This can take a while."} if running else None,
+            "summary": SUMMARY["text"], "doing": LAST_ACTION["text"], "expert": EXPERT, "sharing": sharing,
+            "found": found_lines(), "activity": list(ACTIVITY)[-30:]}
+
+
+def ui_action(data: dict) -> tuple[int, dict]:
+    """A click or key on the PC's screen. Approvals name the job, so a stale click can't approve another."""
+    action = data.get("action")
+    if action in ("approve", "reject"):
+        waiting = pending_jobs()
+        if not waiting or waiting[0]["id"] != data.get("job_id"):
+            return 409, {"error": "That request is no longer waiting."}
+        word = waiting[0].get("confirm")
+        if action == "approve" and word and str(data.get("word", "")).strip().upper() != word:
+            return 400, {"error": f"Type {word} to approve."}
+        decide(action == "approve")
+    elif action == "new_link":
+        LINK.new_link()
+    elif action == "stop_sharing":
+        LINK.stop()
+    elif action == "expert":
+        set_expert(bool(data.get("on")))
+    elif action == "power_off" and CONSOLE_MODE:
+        power_off(LINK)
+    else:
+        return 400, {"error": "Unknown action."}
+    if SCREEN:
+        SCREEN.refresh()
+    return 200, {"ok": True}
+
+
+class UIHandler(BaseHTTPRequestHandler):
+    """Serves the screen page. Only for this PC: the Host header must be 127.0.0.1/localhost (no DNS
+    rebinding) and every request carries the per-boot key that only the kiosk window was given."""
+
+    def _send(self, code: int, kind: str, body: bytes) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", kind)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _allowed(self, key: str) -> bool:
+        host_ok = self.headers.get("Host", "") in (f"127.0.0.1:{UI_PORT}", f"localhost:{UI_PORT}")
+        origin = self.headers.get("Origin")
+        origin_ok = origin is None or origin in (f"http://127.0.0.1:{UI_PORT}", f"http://localhost:{UI_PORT}")
+        return host_ok and origin_ok and secrets.compare_digest(key.encode(), UI_KEY.encode())
+
+    def do_GET(self) -> None:
+        url = urlparse(self.path)
+        if url.path == "/" and self._allowed(parse_qs(url.query).get("k", [""])[0]):
+            return self._send(200, "text/html; charset=utf-8", UI_PAGE.encode())
+        if url.path == "/state" and self._allowed(self.headers.get("X-Rescue-Key", "")):
+            return self._send(200, "application/json", json.dumps(ui_state(), default=str).encode())
+        self._send(403, "text/plain", b"Forbidden")
+
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length") or 0)
+        if self.path != "/action" or not self._allowed(self.headers.get("X-Rescue-Key", "")) or length > 10_000:
+            return self._send(403, "text/plain", b"Forbidden")
+        try:
+            code, body = ui_action(json.loads(self.rfile.read(length) or b"{}"))
+        except Exception as e:
+            log.exception("Screen action failed")
+            code, body = 500, {"error": str(e)}
+        self._send(code, "application/json", json.dumps(body).encode())
+
+    def log_message(self, *args) -> None:
+        pass
+
+
+def start_ui_server() -> str | None:
+    """Serve the screen page on 127.0.0.1; returns its URL (with the key), or None if the port is taken."""
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", UI_PORT), UIHandler)
+    except OSError as e:
+        log.warning("The screen page could not start (%s); the text screen still works.", e)
+        return None
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{UI_PORT}/?k={UI_KEY}"
+    if CONSOLE_MODE:
+        with contextlib.suppress(OSError):
+            UI_URL_FILE.parent.mkdir(parents=True, exist_ok=True)
+            UI_URL_FILE.write_text(url)
+            try:  # readable by the kiosk window's own user only
+                shutil.chown(UI_URL_FILE, group="rescue-ui")
+                os.chmod(UI_URL_FILE, 0o640)
+            except (LookupError, OSError):
+                os.chmod(UI_URL_FILE, 0o644)
+    return url
+
+
+UI_PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Rescue AI</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root { --bg: #E7E5E0; --ink: #1C1B19; --muted: #6A665F; }
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; background: var(--bg); color: var(--ink);
+  font-family: "Inter", "Inter Variable", "DejaVu Sans", system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
+main { min-height: 100vh; padding: clamp(24px, 5vh, 56px) clamp(24px, 7.5vw, 104px) clamp(24px, 5vh, 52px);
+  display: flex; flex-direction: column; }
+.brand { font-size: 15px; letter-spacing: .04em; color: var(--muted); }
+h1 { font-weight: 400; font-size: clamp(34px, 5.2vw, 56px); letter-spacing: -0.025em; line-height: 1.1;
+  margin: clamp(24px, 6vh, 56px) 0 10px; }
+h2 { font-weight: 400; font-size: clamp(22px, 2.6vw, 30px); letter-spacing: -0.01em; margin: 28px 0 12px; }
+p { margin: 0; }
+.lead { font-size: clamp(17px, 1.7vw, 21px); color: var(--muted); }
+.connect { display: flex; flex-wrap: wrap; gap: clamp(24px, 4vw, 52px); align-items: center; margin-top: clamp(20px, 5vh, 44px); }
+.qr svg { width: clamp(150px, 26vh, 220px); height: auto; display: block; }
+.qr svg path { fill: var(--ink); }
+.url { font-size: clamp(15px, 1.5vw, 19px); line-height: 1.55; word-break: break-all; max-width: 640px; }
+.hint { font-size: 16px; color: var(--muted); margin-top: 14px; }
+.lines { font-size: clamp(16px, 1.5vw, 19px); line-height: 1.75; max-width: 1100px; }
+.muted { color: var(--muted); }
+.bottom { margin-top: auto; padding-top: 28px; }
+.facts { font-size: clamp(15px, 1.4vw, 18px); line-height: 1.75; }
+nav { margin-top: 26px; display: flex; flex-wrap: wrap; gap: 14px 44px; font-size: 18px; align-items: baseline; }
+nav.big { font-size: 26px; gap: 56px; margin-top: 36px; }
+a { color: var(--ink); font-weight: 700; text-decoration: underline; text-underline-offset: 6px;
+  text-decoration-thickness: 2px; cursor: pointer; user-select: none; }
+a.off { color: var(--muted); cursor: default; }
+.key { color: var(--muted); font-weight: 400; font-size: .7em; margin-left: 8px; }
+input.word { font: inherit; letter-spacing: .12em; text-transform: uppercase; background: transparent; color: var(--ink);
+  border: 0; border-bottom: 2px solid var(--ink); width: 8em; margin-left: 14px; padding: 0 0 2px; outline: none; }
+.details { margin-top: 32px; font-size: 15px; line-height: 1.7; color: var(--muted); }
+.details p { white-space: pre-wrap; }
+.details .title { color: var(--ink); margin-top: 14px; }
+</style></head>
+<body><main id="app"><div class="brand">Rescue AI</div><h1>Starting.</h1></main>
+<script>
+const KEY = new URLSearchParams(location.search).get("k") || "";
+const app = document.getElementById("app");
+let state = null, last = "", details = false, powerArmed = 0, typed = "";
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+const cap = s => s ? s[0].toUpperCase() + s.slice(1) : "";
+
+async function refresh() {
+  try {
+    const r = await fetch("/state", {headers: {"X-Rescue-Key": KEY}, cache: "no-store"});
+    if (!r.ok) return;
+    const text = await r.text();
+    if (text !== last) { last = text; state = JSON.parse(text); render(); }
+  } catch (e) { /* the agent is restarting: try again in a moment */ }
+}
+
+async function act(action, extra = {}) {
+  try {
+    await fetch("/action", {method: "POST", body: JSON.stringify({action, ...extra}),
+      headers: {"X-Rescue-Key": KEY, "Content-Type": "application/json"}});
+  } finally { last = ""; refresh(); }
+}
+
+function run(what) {
+  const c = state && state.card;
+  if (what === "approve" && c) {
+    if (c.confirm && typed.trim().toUpperCase() !== c.confirm) return;
+    act("approve", {job_id: c.id, word: typed.trim().toUpperCase()}); typed = "";
+  } else if (what === "reject" && c) { act("reject", {job_id: c.id}); typed = ""; }
+  else if (what === "details") { details = !details; render(); }
+  else if (what === "expert") act("expert", {on: !state.expert});
+  else if (what === "power_off") {
+    if (Date.now() < powerArmed) act("power_off");
+    else { powerArmed = Date.now() + 5000; render(); setTimeout(render, 5100); }
+  } else if (!c) act(what);
+}
+
+function render() {
+  const s = state, c = s.card;
+  let h = `<div class="brand">Rescue AI${s.expert ? " &nbsp;·&nbsp; expert mode is on" : ""}</div>`;
+  if (c) {
+    h += `<h1>Claude wants to make a change.</h1><h2>${esc(c.title)}</h2><div class="lines">`
+       + c.details.map(d => `<p>${esc(d)}</p>`).join("")
+       + `<p>Claude's reason: ${esc(c.reason)}</p><p class="muted">${esc(cap(c.risk))} risk. ${esc(c.undo)}</p></div>`;
+    if (c.confirm) h += `<p class="lines" style="margin-top:28px">To approve, type ${esc(c.confirm)}`
+                      + `<input class="word" id="word" autocomplete="off" spellcheck="false"></p>`;
+    const ready = !c.confirm || typed.trim().toUpperCase() === c.confirm;
+    h += `<nav class="big"><span><a data-act="approve" class="${ready ? "" : "off"}">Approve</a>`
+       + `<span class="key">${c.confirm ? "Enter" : "Y"}</span></span>`
+       + `<span><a data-act="reject">Reject</a><span class="key">${c.confirm ? "Esc" : "N"}</span></span></nav>`
+       + `<div class="bottom"><p class="facts muted">Nothing changes until you choose.`
+       + `${c.more ? ` ${c.more} more waiting after this one.` : ""}</p></div>`;
+  } else {
+    h += `<h1>${esc(s.headline)}</h1>${s.lead ? `<p class="lead">${esc(s.lead)}</p>` : ""}`;
+    if (s.working) h += `<p class="lines" style="margin-top:28px">${esc(s.working.progress)}</p>`;
+    else if (s.url) h += `<div class="connect"><div class="qr">${s.qr}</div><div><div class="url">${esc(s.url)}</div>`
+                       + `<div class="hint">In Claude: Settings → Connectors → Add custom connector</div></div></div>`;
+    if (details) h += `<div class="details"><p class="title">On this PC</p>` + s.found.map(f => `<p>${esc(f)}</p>`).join("")
+                    + `<p class="title">What happened</p>` + s.activity.slice(-12).map(a => `<p>${esc(a)}</p>`).join("") + `</div>`;
+    h += `<div class="bottom"><div class="facts"><p>${esc(s.summary)}</p>`
+       + `${s.doing ? `<p class="muted">${esc(s.doing)}</p>` : ""}</div><nav><a data-act="new_link">New link</a>`
+       + `${s.sharing ? `<a data-act="stop_sharing">Stop sharing</a>` : ""}`
+       + `<a data-act="details">${details ? "Hide details" : "Details"}</a>`
+       + `<a data-act="expert">${s.expert ? "Turn off expert mode" : "Expert mode"}</a>`
+       + `<a data-act="power_off">${Date.now() < powerArmed ? "Click again to power off" : "Power off"}</a></nav></div>`;
+  }
+  app.innerHTML = h;
+  const w = document.getElementById("word");
+  if (w) {
+    w.value = typed; w.focus();
+    w.addEventListener("input", () => {
+      typed = w.value;
+      document.querySelector('a[data-act="approve"]').classList.toggle("off", typed.trim().toUpperCase() !== c.confirm);
+    });
+  }
+}
+
+document.addEventListener("click", e => {
+  const a = e.target.closest("a[data-act]");
+  if (a && !a.classList.contains("off")) run(a.dataset.act);
+});
+document.addEventListener("keydown", e => {
+  if (!state) return;
+  const c = state.card, k = e.key.toLowerCase();
+  if (c && c.confirm) {
+    if (e.key === "Enter") run("approve"); else if (e.key === "Escape") run("reject");
+    return;
+  }
+  if (c) { if (k === "y") run("approve"); else if (k === "n") run("reject"); return; }
+  const keys = {l: "new_link", s: "stop_sharing", d: "details", e: "expert", p: "power_off"};
+  if (keys[k]) run(keys[k]);
+});
+setInterval(refresh, 1000);
+refresh();
+</script></body></html>
+"""
+
+
 def found_lines() -> list[str]:
     if not PARTS:
         return ["(no Windows-related partitions on the internal disks)"]
@@ -3446,7 +3756,6 @@ def key_loop(link) -> None:
 def handle_key(key: str, link) -> None:
     """Y/N decide the waiting change (or type its confirmation word + Enter); L, S, E and P manage the
     link, expert mode and power."""
-    global EXPERT
     waiting = pending_jobs()
     word = waiting[0].get("confirm") if waiting else None
     if word:  # every key goes to the confirmation word, so letters can't trigger anything else
@@ -3475,16 +3784,25 @@ def handle_key(key: str, link) -> None:
     elif key == "s":
         link.stop()
     elif key == "e":
-        EXPERT = not EXPERT
-        state = "ON: Claude may ask to run commands (each one still needs Y)" if EXPERT else "OFF"
-        ACTIVITY.append(f"{dt.datetime.now():%H:%M:%S}  Expert mode {state}")
-        log.info("Expert mode %s", state)
+        set_expert(not EXPERT)
     elif key == "p" and SCREEN:
-        link.close()
-        unmount_ours()
-        subprocess.Popen(["systemctl", "poweroff"], stdin=subprocess.DEVNULL)
+        power_off(link)
     if SCREEN:
         SCREEN.refresh()
+
+
+def set_expert(on: bool) -> None:
+    global EXPERT
+    EXPERT = on
+    state = "ON: Claude may ask to run commands (each one still needs approval)" if on else "OFF"
+    ACTIVITY.append(f"{dt.datetime.now():%H:%M:%S}  Expert mode {state}")
+    log.info("Expert mode %s", state)
+
+
+def power_off(link) -> None:
+    link.close()
+    unmount_ours()
+    subprocess.Popen(["systemctl", "poweroff"], stdin=subprocess.DEVNULL)
 
 
 def restore_tty() -> None:
@@ -3519,7 +3837,7 @@ def warm_up() -> None:
 
 
 def main() -> None:
-    global ALLOW_PERSONAL, SCREEN
+    global ALLOW_PERSONAL, SCREEN, LINK, CONSOLE_MODE
     ap = argparse.ArgumentParser(description="Rescue AI: MCP server for examining and repairing a Windows PC.")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--host", default="127.0.0.1",
@@ -3533,6 +3851,7 @@ def main() -> None:
                     help="full-screen display on the PC's monitor (used by the Rescue USB)")
     args = ap.parse_args()
     ALLOW_PERSONAL = args.allow_personal_files
+    CONSOLE_MODE = args.console
 
     is_root = hasattr(os, "geteuid") and os.geteuid() == 0
     log_path = "/var/log/rescue-ai.log" if is_root else "rescue-ai.log"
@@ -3558,6 +3877,7 @@ def main() -> None:
         print("\n".join("  " + line for line in found_lines()))
     threading.Thread(target=warm_up, daemon=True).start()
     threading.Thread(target=job_worker, daemon=True).start()
+    threading.Thread(target=lambda: SUMMARY.update(text=pc_summary()), daemon=True).start()
 
     gate = TokenGate(mcp.streamable_http_app(), secrets.token_urlsafe(24))
     if args.no_tunnel:
@@ -3574,6 +3894,10 @@ def main() -> None:
         print("\nOpening the secure link (takes about 10 seconds)...", flush=True)
     link.start()
     threading.Thread(target=key_loop, args=(link,), daemon=True).start()
+    LINK = link
+    page = start_ui_server()
+    if page and not args.console:
+        print(f"\nThis PC's screen (approve changes here or in this terminal): open {page} in Firefox\n", flush=True)
 
     try:
         uvicorn.run(gate, host=args.host, port=args.port, log_level="warning")

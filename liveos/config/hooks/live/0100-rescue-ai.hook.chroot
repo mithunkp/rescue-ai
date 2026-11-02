@@ -12,6 +12,10 @@ python3 -c "import urllib.request; urllib.request.urlretrieve('https://github.co
 dpkg -i /tmp/cloudflared.deb
 rm -f /tmp/cloudflared.deb
 
+# The PC's screen (a page in a kiosk window) runs as its own unprivileged user
+useradd --system --create-home --home-dir /var/lib/rescue-ui --shell /usr/sbin/nologin rescue-ui
+systemctl enable rescue-screen.service
+
 # Screen 1 shows Rescue AI instead of a login prompt
 systemctl mask getty@tty1.service
 systemctl enable rescue-agent.service NetworkManager.service systemd-timesyncd.service

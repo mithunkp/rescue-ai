@@ -1,0 +1,27 @@
+{
+  "policies": {
+    "WebsiteFilter": {
+      "Block": ["<all_urls>"],
+      "Exceptions": ["http://127.0.0.1:8766/*"]
+    },
+    "DisableTelemetry": true,
+    "DisableFirefoxStudies": true,
+    "DisablePocket": true,
+    "DisableFirefoxAccounts": true,
+    "DisableDeveloperTools": true,
+    "DisableProfileImport": true,
+    "BlockAboutConfig": true,
+    "DontCheckDefaultBrowser": true,
+    "NoDefaultBookmarks": true,
+    "OverrideFirstRunPage": "",
+    "OverridePostUpdatePage": "",
+    "UserMessaging": {
+      "WhatsNew": false,
+      "ExtensionRecommendations": false,
+      "FeatureRecommendations": false,
+      "UrlbarInterventions": false,
+      "SkipOnboarding": true,
+      "MoreFromMozilla": false
+    }
+  }
+}

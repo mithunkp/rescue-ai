@@ -1,0 +1,5 @@
+# Session for the Rescue AI screen (rescue-screen.service): lets systemd-logind give the
+# kiosk window the display, keyboard and mouse.
+account  required pam_unix.so
+session  required pam_unix.so
+session  required pam_systemd.so

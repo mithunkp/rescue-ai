@@ -32,3 +32,48 @@ jobs:
             liveos/rescue-ai-amd64.iso.sha256
           compression-level: 0
           retention-days: 14
+
+  # Boot the new ISO in a virtual machine (UEFI, internet, no Windows disk) and photograph its screen.
+  boot-test:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: rescue-ai-iso
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 ovmf
+          sudo chmod 666 /dev/kvm 2>/dev/null || true
+
+      - name: Boot the ISO and take screenshots
+        run: |
+          accel=tcg; [ -w /dev/kvm ] && accel=kvm
+          echo "acceleration: $accel"
+          cp /usr/share/OVMF/OVMF_VARS_4M.fd vars.fd
+          mkdir -p shots
+          qemu-system-x86_64 -machine q35,accel=$accel -m 3072 -smp 2 \
+            -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
+            -drive if=pflash,format=raw,file=vars.fd \
+            -cdrom rescue-ai-amd64.iso -nic user,model=e1000 -vga std -display none \
+            -monitor unix:monitor.sock,server,nowait &
+          prev=0
+          for t in 60 120 180 300 420; do
+            sleep $(( t - prev )); prev=$t
+            python3 -c "import socket, sys, time; s = socket.socket(socket.AF_UNIX); s.connect('monitor.sock'); s.sendall(f'screendump shots/boot-{sys.argv[1]}s.png -f png\n'.encode()); time.sleep(3)" $t
+          done
+          ls -la shots
+
+      - name: Upload the screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-screens
+          path: shots/
+          retention-days: 14

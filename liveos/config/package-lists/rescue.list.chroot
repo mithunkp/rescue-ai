@@ -12,6 +12,16 @@ ca-certificates
 firmware-realtek
 firmware-linux-free
 
+# The PC's screen: one calm page in a full-screen Firefox window, inside the cage kiosk compositor.
+# If graphics can't start on a PC, the text screen on tty1 stays.
+cage
+firefox-esr
+fonts-inter
+libpam-systemd
+dbus
+xkb-data
+kbd
+
 # Rescue agent runtime (hivex edits the offline Windows registry; hivexsh etc. for expert mode)
 python3
 python3-venv

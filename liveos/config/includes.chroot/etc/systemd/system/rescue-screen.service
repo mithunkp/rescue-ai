@@ -1,0 +1,33 @@
+[Unit]
+Description=Rescue AI screen (a calm page in a full-screen window)
+Documentation=file:///opt/rescue-ai/rescue_agent.py
+After=rescue-agent.service systemd-user-sessions.service systemd-logind.service
+Wants=rescue-agent.service
+# After 3 failed starts the text screen on tty1 stays (ExecStopPost switches back to it)
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=rescue-ui
+PAMName=rescue-screen
+TTYPath=/dev/tty7
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+StandardInput=tty-fail
+StandardOutput=journal
+StandardError=journal
+UtmpIdentifier=tty7
+UtmpMode=user
+# No GPU driver is loaded (nomodeset), so draw in software
+Environment=WLR_RENDERER=pixman WLR_NO_HARDWARE_CURSORS=1 MOZ_ENABLE_WAYLAND=1
+# Wait until the agent has written the page address (it holds a per-boot key)
+ExecStartPre=/bin/sh -c 'for i in $(seq 360); do [ -s /run/rescue-ai/ui-url ] && exit 0; sleep 0.5; done; exit 1'
+ExecStart=/bin/sh -c 'exec /usr/bin/cage -s -- /usr/bin/firefox-esr --kiosk --private-window "$(cat /run/rescue-ai/ui-url)"'
+ExecStopPost=+/usr/bin/chvt 1
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

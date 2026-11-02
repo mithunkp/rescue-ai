@@ -7,8 +7,10 @@ A small bootable USB image (about 0.5–0.7 GB). Boot a broken Windows PC from i
 1. The boot menu starts **Rescue AI** automatically after 5 seconds. Secure Boot can stay on.
 2. Linux starts, connects through the Ethernet cable on its own, and syncs the clock.
 3. The agent mounts Windows **read-only** and opens the secure link.
-4. Screen 1 shows the status, the link, a QR code, what was found, and what Claude is doing.
-5. When Claude wants to change something, a card fills the top of the screen showing exactly what will change, the risk, and Claude's reason. Nothing happens until you press **Y**.
+4. The screen shows one calm page: the status, the link and QR code, what was found, and what Claude is doing, in plain words. It has a soft grey background and black text, and only clickable options are bold and underlined. Mouse and keys both work. See [`docs/screen/`](../docs/screen/) for screenshots.
+5. When Claude wants to change something, the page shows exactly what will change, the risk, and Claude's reason. Nothing happens until you click **Approve** or press **Y**. For the riskiest changes, you type a word such as `RESET`.
+
+The page runs in a locked-down Firefox kiosk window (in the `cage` compositor, as its own unprivileged user) that can only open this page. If a PC's graphics can't start, the text screen on tty1 shows the same information, with the same keys.
 
 | Key | Action |
 |---|---|
@@ -16,7 +18,8 @@ A small bootable USB image (about 0.5–0.7 GB). Boot a broken Windows PC from i
 | **L** | New link (the old one stops working) |
 | **S** | Stop sharing |
 | **E** | Expert mode on/off: lets Claude ask to run commands (each one still needs Y) |
-| **P** | Power off |
+| **D** | Details: partitions and the full activity list (page only) |
+| **P** | Power off (on the page: press or click twice) |
 
 For troubleshooting, press **Alt+F2** for a shell (`sudo journalctl -u rescue-agent`, log in `/var/log/rescue-ai.log`), then **Alt+F1** to go back.
 
