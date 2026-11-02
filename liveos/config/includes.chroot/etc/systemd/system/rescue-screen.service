@@ -22,6 +22,9 @@ UtmpIdentifier=tty7
 UtmpMode=user
 # No GPU driver is loaded (nomodeset), so draw in software
 Environment=WLR_RENDERER=pixman WLR_NO_HARDWARE_CURSORS=1 MOZ_ENABLE_WAYLAND=1
+# Only with a graphics device (DRM) the kiosk can use: with nomodeset there is just the firmware
+# framebuffer, cage can't start, and the text screen on tty1 stays (the unit is skipped, not failed).
+ExecCondition=/bin/sh -c 'ls /dev/dri/card* >/dev/null 2>&1'
 # Wait until the agent has written the page address (it holds a per-boot key)
 ExecStartPre=/bin/sh -c 'for i in $(seq 360); do [ -s /run/rescue-ai/ui-url ] && exit 0; sleep 0.5; done; exit 1'
 # Show screen 7: logind only hands the display to the session on the screen being shown, and the

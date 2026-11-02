@@ -3533,6 +3533,7 @@ class UIHandler(BaseHTTPRequestHandler):
         if url.path == "/" and self._allowed(parse_qs(url.query).get("k", [""])[0]):
             return self._send(200, "text/html; charset=utf-8", UI_PAGE.encode())
         if url.path == "/state" and self._allowed(self.headers.get("X-Rescue-Key", "")):
+            UI_SEEN["last"] = time.time()  # the page is really on screen (see screen_watchdog)
             return self._send(200, "application/json", json.dumps(ui_state(), default=str).encode())
         self._send(403, "text/plain", b"Forbidden")
 
@@ -3549,6 +3550,31 @@ class UIHandler(BaseHTTPRequestHandler):
 
     def log_message(self, *args) -> None:
         pass
+
+
+KIOSK_VT = "tty7"
+UI_SEEN = {"last": 0.0}
+
+
+def screen_watchdog() -> None:
+    """On the Rescue USB: if the kiosk's screen is in front but the page isn't really showing (the
+    browser never asked for /state, or stopped asking), go back to the text screen and stop the kiosk,
+    so a PC never sits on a blank screen. Doesn't rely on the kiosk program exiting when it fails."""
+    shown_since = None
+    while True:
+        time.sleep(5)
+        if read_sys("/sys/class/tty/tty0/active") != KIOSK_VT:
+            shown_since = None
+            continue
+        now = time.time()
+        shown_since = shown_since or now
+        never_seen = UI_SEEN["last"] < shown_since
+        quiet = now - (shown_since if never_seen else UI_SEEN["last"])
+        if quiet > (90 if never_seen else 30):
+            log.warning("The screen page isn't showing; switching back to the text screen.")
+            run(["systemctl", "stop", "rescue-screen.service"])
+            run(["chvt", "1"])
+            shown_since = None
 
 
 def start_ui_server() -> str | None:
@@ -3965,6 +3991,8 @@ def main() -> None:
     threading.Thread(target=key_loop, args=(link,), daemon=True).start()
     LINK = link
     page = start_ui_server()
+    if args.console:
+        threading.Thread(target=screen_watchdog, daemon=True).start()
     if page and not args.console:
         print(f"\nThis PC's screen (approve changes here or in this terminal): open {page} in Firefox\n", flush=True)
 
