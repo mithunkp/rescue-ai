@@ -1,7 +1,7 @@
 mcp>=1.13,<2
 uvicorn>=0.30
 anyio>=4
-regipy>=3.1
+regipy>=6.5.0
 qrcode>=7
 # Event-log reader: start.sh installs "evtx" (fast) or, if that fails, "python-evtx".
 # Never install both: on Windows their folders clash.
