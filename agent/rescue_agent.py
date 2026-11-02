@@ -2880,16 +2880,24 @@ def request_windows_repair(repair: str, reason: str, partition: str = "", packag
 
 
 RESTORE_MOUNTS = Path("/mnt/rescue-restore")
-# hive -> keys a healthy hive always has (checked without reading any values)
-HIVE_KEYS = {
-    "SYSTEM": ["Select", "ControlSet001\\Control", "ControlSet001\\Services", "ControlSet001\\Control\\ComputerName"],
-    "SOFTWARE": ["Microsoft\\Windows NT\\CurrentVersion", "Microsoft\\Windows\\CurrentVersion", "Classes"],
-    "SAM": ["SAM"],
-    "SECURITY": ["Policy"],
-    "DEFAULT": ["Control Panel", "Software"],
+# hive -> (key, values it must have with content ("A|B": either), fewest subkeys a healthy one has).
+# A key can exist and still be gutted, so values and subkey counts are checked too.
+HIVE_CHECKS = {
+    "SYSTEM": [("Select", ["Current"], 0),
+               ("ControlSet001\\Control", [], 10),
+               ("ControlSet001\\Services", [], 50),
+               ("ControlSet001\\Control\\ComputerName\\ComputerName", ["ComputerName"], 0)],
+    "SOFTWARE": [("Microsoft\\Windows NT\\CurrentVersion", ["ProductName", "EditionID", "CurrentBuild|CurrentBuildNumber"], 5),
+                 ("Microsoft\\Windows\\CurrentVersion", ["ProgramFilesDir"], 10),
+                 ("Classes", [], 100)],
+    "SAM": [("SAM\\Domains", [], 1)],  # opened and counted only; no values are read
+    "SECURITY": [("Policy", [], 1)],
+    "DEFAULT": [("Control Panel", [], 1), ("Software", [], 1)],
     "COMPONENTS": [],
     "DRIVERS": [],
 }
+NTUSER_CHECKS = [("Software", [], 1)]
+SHRINK = 0.5  # flag a key with less than half the subkeys or values it has in the restore point
 RESTORABLE_HIVES = ("SYSTEM", "SOFTWARE", "DEFAULT", "COMPONENTS", "DRIVERS")
 STAGING_LIMIT = 2 * 2**30  # files are read into memory before the partition is written
 
@@ -2974,12 +2982,14 @@ def restore_point(name: str) -> tuple[dict, dict]:
     return rp, PARTS[rp["base"]]
 
 
-def hive_health(path: Path | None, keys: list[str]) -> dict:
-    """Can this registry file be opened, and does it have the keys every healthy one has?"""
+def hive_health(path: Path | None, checks: list[tuple], read_values: bool = True) -> dict:
+    """Can this registry file be opened, and do its core keys exist with their values and a healthy
+    number of subkeys? Also counts subkeys and values of the root and each checked key, so a hive can
+    be compared with the same hive in a restore point (compare_hives)."""
     if path is None:
         return {"status": "DAMAGED: missing"}
     st = path.stat()
-    info = {"size_mb": round(st.st_size / 2**20, 1), "modified": mtime_str(path)}
+    info = {"size_mb": round(st.st_size / 2**20, 1), "size_bytes": st.st_size, "modified": mtime_str(path)}
     with open(path, "rb") as f:
         head = f.read(4)
     if st.st_size == 0 or head != b"regf":
@@ -2988,17 +2998,49 @@ def hive_health(path: Path | None, keys: list[str]) -> dict:
         top = hive_root(open_hive(path))
     except Exception as e:
         return {**info, "status": f"DAMAGED: can't be opened ({type(e).__name__}: {e})"}
-    missing = []
-    for key in keys:
+    problems, counts = [], {"(root)": {"subkeys": sum(1 for _ in top.iter_subkeys()), "values": 0}}
+    for key, required, min_subkeys in checks:
         try:
-            subkey(top, key)
+            k = subkey(top, key)
         except Exception:
-            missing.append(key)
-    status = "ok" if not missing else "DAMAGED: missing " + ", ".join(missing)
+            problems.append(f"{key} is missing")
+            continue
+        n_sub = sum(1 for _ in k.iter_subkeys())
+        values = reg_values(k) if read_values else {}
+        counts[key] = {"subkeys": n_sub, "values": len(values) if read_values else None}
+        lower = {name.lower(): v for name, v in values.items()}
+        empty = [r for r in required if not any(lower.get(a.lower()) not in (None, "", b"") for a in r.split("|"))]
+        if empty:
+            problems.append(f"{key} has no {', '.join(r.replace('|', ' or ') for r in empty)}")
+        if n_sub < min_subkeys:
+            problems.append(f"{key} has only {n_sub} subkeys (a healthy one has at least {min_subkeys})")
+    status = "ok" if not problems else "DAMAGED: " + "; ".join(problems)
     if hive_dirty(path):
         status += " (has changes waiting in its .LOG files)"
     logs = {ext: lp.stat().st_size for ext in ("LOG1", "LOG2") if (lp := ci_path(path.parent, f"{path.name}.{ext}"))}
-    return {**info, "status": status, "log_files_bytes": logs}
+    return {**info, "status": status, "counts": counts, "log_files_bytes": logs}
+
+
+def compare_hives(now: dict, before: dict, where: str) -> list[str]:
+    """Sudden shrinkage compared with the same hive in a restore point: a gutted key or file."""
+    drops = []
+    for key, n in (now.get("counts") or {}).items():
+        b = (before.get("counts") or {}).get(key)
+        if not b:
+            continue
+        if b["subkeys"] >= 10 and n["subkeys"] < b["subkeys"] * SHRINK:
+            drops.append(f"{key} has {n['subkeys']} subkeys, {b['subkeys']} in {where}")
+        if (b["values"] or 0) >= 5 and (n["values"] or 0) < b["values"] * SHRINK:
+            drops.append(f"{key} has {n['values']} values, {b['values']} in {where}")
+    if before.get("size_bytes", 0) >= 1 << 20 and now.get("size_bytes", 0) < before["size_bytes"] * SHRINK:
+        drops.append(f"the file is {now['size_mb']} MB, {before['size_mb']} MB in {where}")
+    return drops
+
+
+def flag_shrinkage(health: dict, drops: list[str]) -> None:
+    if drops:
+        prefix = "DAMAGED: " if health["status"].startswith("ok") else health["status"] + "; "
+        health["status"] = prefix + "much smaller than before: " + "; ".join(drops)
 
 
 def stage(sources: list[tuple[str, Path]], folder: Path) -> dict[str, Path]:
@@ -3058,23 +3100,49 @@ def list_restore_points(partition: str = "") -> dict:
     return {"partition": part["name"], "count": len(stores), "restore_points": stores or "none"}
 
 
-@tool
-def check_registry(partition: str = "") -> dict:
-    """Health of every Windows registry file (SYSTEM, SOFTWARE, SAM, SECURITY, DEFAULT, COMPONENTS,
-    DRIVERS and each user's NTUSER.DAT): opens each one and checks that its core keys exist, e.g.
-    SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion. Works on a restore point too ("<partition>@rpN")."""
-    part = get_part(partition)
-    root = Path(part["mountpoint"])
+def registry_report(root: Path) -> dict:
     config = ci_path(root, "Windows/System32/config")
     if config is None:
         raise UserError("There's no Windows registry on this partition.")
-    report = {name: hive_health(ci_path(config, name), keys) for name, keys in HIVE_KEYS.items()}
+    report = {name: hive_health(ci_path(config, name), checks, read_values=name not in ("SAM", "SECURITY"))
+              for name, checks in HIVE_CHECKS.items()}
     users = ci_path(root, "Users")
     for user in sorted(os.listdir(users)) if users else []:
         if (users / user).is_dir() and (nt := ci_path(users / user, "NTUSER.DAT")):
-            report[f"NTUSER:{user}"] = hive_health(nt, ["Software"])
+            report[f"NTUSER:{user}"] = hive_health(nt, NTUSER_CHECKS)
+    return report
+
+
+@tool
+def check_registry(partition: str = "", compare_with: str = "newest") -> dict:
+    """Health of every Windows registry file (SYSTEM, SOFTWARE, SAM, SECURITY, DEFAULT, COMPONENTS,
+    DRIVERS and each user's NTUSER.DAT). Opens each one and checks its core keys exist WITH their
+    values (e.g. SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion needs ProductName, EditionID and
+    CurrentBuild) and enough subkeys, then compares subkey/value counts and file sizes with the same
+    hives in a restore point to catch a key or file that was gutted. compare_with: "newest" (default),
+    a restore point like "nvme0n1p3@rp2", or "none". Works on a restore point too ("<partition>@rpN")."""
+    part = get_part(partition)
+    report = registry_report(Path(part["mountpoint"]))
+    comparison = "none"
+    if compare_with != "none" and part["kind"] == "ntfs" and part.get("device"):
+        try:
+            if compare_with == "newest":
+                stores = vss_stores(part)
+                if not stores:
+                    raise UserError("this partition has no restore points")
+                compare_with = stores[-1]["restore_point"]
+            rp = get_part(compare_with)
+            if rp["kind"] != "snapshot" or rp["base"] != part["name"]:
+                raise UserError(f"{compare_with} isn't a restore point of {part['name']}")
+            before = registry_report(Path(rp["mountpoint"]))
+            for name, health in report.items():
+                if name in before:
+                    flag_shrinkage(health, compare_hives(health, before[name], compare_with))
+            comparison = f"compared with {compare_with}"
+        except UserError as e:
+            comparison = f"not compared: {e}"
     damaged = [name for name, h in report.items() if not h["status"].startswith("ok")]
-    return {"partition": part["name"], "damaged": damaged or "none", "hives": report}
+    return {"partition": part["name"], "damaged": damaged or "none", "comparison": comparison, "hives": report}
 
 
 @tool(change=True)
@@ -3091,10 +3159,11 @@ def request_restore_registry_hive(hive: str, restore_point_name: str, reason: st
     check_can_change(base)
     check_ntfs_state(base)
     rel = f"Windows/System32/config/{name}"
-    old = hive_health(ci_path(Path(rp["mountpoint"]), rel), HIVE_KEYS[name])
+    old = hive_health(ci_path(Path(rp["mountpoint"]), rel), HIVE_CHECKS[name])
     if not old["status"].startswith("ok"):
         raise UserError(f"The restore point's {name} hive isn't healthy either: {old['status']}")
-    now = hive_health(ci_path(Path(base["mountpoint"]), rel), HIVE_KEYS[name])
+    now = hive_health(ci_path(Path(base["mountpoint"]), rel), HIVE_CHECKS[name])
+    flag_shrinkage(now, compare_hives(now, old, restore_point_name))
     rels = [rel, f"{rel}.LOG1", f"{rel}.LOG2"]
 
     def run_fn(job):

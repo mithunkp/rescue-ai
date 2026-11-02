@@ -108,7 +108,8 @@ try:
     check("ntfsfix ran and the partition is clean again", j["state"] == "done" and ra.NTFS_STATES[win_dev] == "clean")
     check("partition protected after the journal reset", protected(part))
 
-    # --- the real PC's problem: SOFTWARE hive missing Microsoft\Windows NT\CurrentVersion
+    # --- the real PC's problem: Microsoft\Windows NT\CurrentVersion still exists but is gutted
+    #     (no values, almost no subkeys), which a "does the key exist" check reported as ok
     sh("umount", part["mountpoint"])
     sh("blockdev", "--setrw", win_dev)
     staging = Path(tempfile.mkdtemp())
@@ -118,14 +119,21 @@ try:
     node = h.root()
     for key in ("Microsoft", "Windows NT", "CurrentVersion"):
         node = next(c for c in h.node_children(node) if h.node_name(c).lower() == key.lower())
-    h.node_delete_child(node)
+    h.node_set_values(node, [])
+    for child in h.node_children(node)[2:]:  # keep 2 subkeys, like the real PC
+        h.node_delete_child(child)
     h.commit(None)
     sh("umount", str(staging))
     part["mountpoint"], part["note"] = ra.mount_readonly(win_dev, name, "ntfs")
     ra.release_caches()
     report = call(ra.check_registry, partition=name)
-    check("check_registry finds the damaged SOFTWARE hive in one step",
-          "SOFTWARE" in report["damaged"] and "CurrentVersion" in report["hives"]["SOFTWARE"]["status"])
+    status = report["hives"]["SOFTWARE"]["status"]
+    print("   ", status)
+    check("check_registry finds the gutted key: its values are missing",
+          "SOFTWARE" in report["damaged"] and "has no ProductName, EditionID, CurrentBuild" in status)
+    check("check_registry finds the gutted key: too few subkeys", "has only 2 subkeys" in status)
+    check("without restore-point tools the comparison says why it was skipped",
+          report["comparison"].startswith("not compared"))
 
     # the second image stands in for a restore point (vshadowmount isn't possible without Windows)
     rp_name = f"{name}@rp1"
@@ -139,9 +147,18 @@ try:
                          "windows": False, "disk_failed": False}
     check("restore point's SOFTWARE hive is healthy",
           call(ra.check_registry, partition=rp_name)["hives"]["SOFTWARE"]["status"] == "ok")
+    report = call(ra.check_registry, partition=name, compare_with=rp_name)
+    status = report["hives"]["SOFTWARE"]["status"]
+    print("   ", status)
+    check("comparison with the restore point flags the sudden drop in subkeys and values",
+          report["comparison"] == f"compared with {rp_name}" and "much smaller than before" in status
+          and f"has 2 subkeys" in status and f"in {rp_name}" in status)
     check("restore points are read-only", "error" in call(ra.request_rename_file, path="Windows/System32/drivers/net.sys",
                                                           new_name="x", reason="t", partition=rp_name))
     r = call(ra.request_restore_registry_hive, hive="SOFTWARE", restore_point_name=rp_name, reason="t")
+    now_line = next(d for d in ra.JOBS[r["job_id"]]["details"] if d.startswith("Now:"))
+    print("    card:", now_line)
+    check("the restore card no longer says the damaged hive is ok", now_line.startswith("Now: DAMAGED"))
     check("hive restore needs the typed word RESTORE", ra.JOBS[r["job_id"]]["confirm"] == "RESTORE")
     j = approve(r, word="RESTORE")
     check("hive restored", j["state"] == "done" and "Windows/System32/config/SOFTWARE" in j["result"]["replaced"])
