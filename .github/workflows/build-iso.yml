@@ -37,7 +37,7 @@ jobs:
   boot-test:
     needs: build
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 40
     defaults:
       run:
         shell: bash
@@ -51,26 +51,43 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends qemu-system-x86 ovmf
           sudo chmod 666 /dev/kvm 2>/dev/null || true
-
-      - name: Boot the ISO and take screenshots
-        run: |
+          cat > boot.sh <<'EOF'
+          #!/bin/bash
+          # boot.sh NAME SECONDS [qemu options]: boot the ISO, screenshot every minute, then screens 2 and 1
+          name=$1; secs=$2; shift 2
           accel=tcg; [ -w /dev/kvm ] && accel=kvm
-          echo "acceleration: $accel"
-          cp /usr/share/OVMF/OVMF_VARS_4M.fd vars.fd
+          echo "$name: acceleration $accel"
+          cp /usr/share/OVMF/OVMF_VARS_4M.fd "vars-$name.fd"
           mkdir -p shots
           qemu-system-x86_64 -machine q35,accel=$accel -m 3072 -smp 2 \
             -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
-            -drive if=pflash,format=raw,file=vars.fd \
-            -cdrom rescue-ai-amd64.iso -nic user,model=e1000 -vga std -display none \
-            -monitor unix:monitor.sock,server,nowait &
-          prev=0
-          for t in 60 120 180 300 420; do
-            sleep $(( t - prev )); prev=$t
-            python3 -c "import socket, sys, time; s = socket.socket(socket.AF_UNIX); s.connect('monitor.sock'); s.sendall(f'screendump shots/boot-{sys.argv[1]}s.png -f png\n'.encode()); time.sleep(3)" $t
+            -drive if=pflash,format=raw,file="vars-$name.fd" \
+            -cdrom rescue-ai-amd64.iso -nic user,model=e1000 -display none \
+            -monitor unix:"mon-$name.sock",server,nowait "$@" &
+          pid=$!
+          mon() { python3 -c "import socket, sys, time; s = socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.sendall((sys.argv[2] + '\n').encode()); time.sleep(2)" "mon-$name.sock" "$1"; }
+          for t in $(seq 60 60 "$secs"); do
+            sleep 60
+            mon "screendump shots/$name-${t}s.png -f png"
           done
-          ls -la shots
+          mon "sendkey ctrl-alt-f2"; sleep 5; mon "screendump shots/$name-tty2.png -f png"
+          mon "sendkey ctrl-alt-f1"; sleep 5; mon "screendump shots/$name-tty1.png -f png"
+          kill $pid; wait $pid 2>/dev/null; true
+          EOF
+          chmod +x boot.sh
 
-      - name: Upload the screenshots
+      - name: Boot like a PC (UEFI boot menu) and take screenshots
+        run: ./boot.sh menu 300 -vga virtio
+
+      - name: Boot again with a log of the whole start-up (every service message)
+        run: |
+          mkdir iso && sudo mount -o loop,ro rescue-ai-amd64.iso iso
+          cp iso/live/vmlinuz iso/live/initrd.img . && sudo umount iso
+          ./boot.sh serial 300 -vga virtio -kernel vmlinuz -initrd initrd.img -serial file:serial.log \
+            -append "boot=live components nomodeset hostname=rescue-ai console=tty1 console=ttyS0,115200 systemd.journald.forward_to_console=1"
+          mv serial.log shots/
+
+      - name: Upload the screenshots and log
         if: always()
         uses: actions/upload-artifact@v4
         with:
